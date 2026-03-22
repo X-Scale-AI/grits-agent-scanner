@@ -90,6 +90,14 @@ PLATFORM = detect_platform()
 def cmd_exists(name):
     return os.system("which {} > /dev/null 2>&1".format(name)) == 0
 
+def cmd_run_output(cmd):
+    """Run a read-only command and return stdout, or None on failure."""
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        return None
+
 def cmd_run(cmd, dry_run=True, sudo=False):
     """Run a command. In dry_run mode print it, do not execute."""
     if dry_run:
@@ -334,9 +342,40 @@ class FixAction:
 # OC01: Enable firewall (OS-aware)
 # ---------------------------------------------------------------------------
 
+def _firewall_already_active():
+    """Return True if a firewall is already enabled on this platform."""
+    if PLATFORM == "macos":
+        alf = cmd_run_output("/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null")
+        if alf and "enabled" in alf.lower():
+            return True
+        pf = cmd_run_output("pfctl -s info 2>/dev/null | head -3")
+        if pf and "enabled" in pf.lower():
+            return True
+        if cmd_run_output("pgrep -f LuLu 2>/dev/null") or cmd_run_output("pgrep -f 'Little Snitch' 2>/dev/null"):
+            return True
+        return False
+    elif PLATFORM == "linux":
+        status = cmd_run_output("ufw status 2>/dev/null")
+        if status and "Status: active" in status:
+            return True
+        ipt = cmd_run_output("iptables -L OUTPUT -n 2>/dev/null | head -5")
+        if ipt and "DROP" in ipt:
+            return True
+        nft = cmd_run_output("nft list ruleset 2>/dev/null | head -10")
+        if nft and "drop" in nft.lower():
+            return True
+        return False
+    return False
+
+
 def fix_firewall():
     fix = FixAction("OC01", "Enable host firewall",
                     "Turns on the firewall. Adds default-deny policy and allows HTTPS/DNS outbound.")
+
+    if _firewall_already_active():
+        fix.skipped     = True
+        fix.skip_reason = "Firewall already active. Nothing to do."
+        return fix
 
     if PLATFORM == "linux":
         if cmd_exists("ufw"):
@@ -425,8 +464,10 @@ def fix_creds_perms():
                     "Set credentials dir owner to root:{} (recursive)".format(group))
         fix.add_cmd("sudo chmod 700 {}".format(cred_dir),
                     "Set credentials dir to 700 (owner only)")
-        fix.add_cmd("sudo chmod 600 {}/*".format(cred_dir),
-                    "Set credential files to 600 (owner read/write only)")
+        # Only chmod files if the directory is non-empty (glob fails on empty dirs)
+        fix.add_cmd(
+            "[ \"$(ls -A {})\" ] && sudo chmod 600 {}/* || true".format(cred_dir, cred_dir),
+            "Set credential files to 600 (owner read/write only, skipped if empty)")
     else:
         fix.skipped     = True
         fix.skip_reason = "No credentials directory found."
@@ -496,6 +537,41 @@ def write_config(config_path, config_dict):
     with open(config_path, "w", encoding="utf-8") as fh:
         json.dump(config_dict, fh, indent=2, ensure_ascii=False)
         fh.write("\n")
+
+# ---------------------------------------------------------------------------
+# Dynamic expert items -- run scanner and filter failing non-auto-fixable
+# ---------------------------------------------------------------------------
+
+# Which check IDs are auto-fixable (must stay in sync with grits-agent-scanner OC_LINES)
+AUTO_FIXABLE_IDS = {"OC01", "OC07", "OC09", "OC12", "OC13", "OC16"}
+
+
+def _print_expert_items(config_arg=None):
+    """Run the scanner in JSON mode and print only failing non-auto-fixable items."""
+    scanner = Path(__file__).parent / "grits-agent-scanner"
+    cmd = [str(scanner), "--json"]
+    if config_arg:
+        cmd += ["--config", config_arg]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        data   = json.loads(result.stdout)
+        expert = [
+            f for f in data.get("findings", [])
+            if not f.get("passed") and f.get("check_id") not in AUTO_FIXABLE_IDS
+        ]
+    except Exception:
+        expert = []
+
+    if not expert:
+        return
+
+    print("  {}STILL NEEDS AN EXPERT{}".format(C["YELLOW"], C["RESET"]))
+    for f in expert:
+        msg = f.get("detail") or f.get("title", "")
+        print("  {}{}{}  {}".format(C["DIM"], f.get("check_id", "?"), C["RESET"], msg))
+    print("")
+    print("  Schedule a free 30-min call:  {}{}{}".format(C["BOLD"], GRITS_CONSULT, C["RESET"]))
+
 
 # ---------------------------------------------------------------------------
 # Print helpers
@@ -738,26 +814,8 @@ def main():
     print("  {}./grits-agent-scanner{}".format(C["BOLD"], C["RESET"]))
     print("")
 
-    # What still needs an expert
-    manual = [
-        ("OC02", "Gateway authentication",    "Requires your own token/auth setup"),
-        ("OC03", "Gateway bind address",       "Review if you need remote access"),
-        ("OC04", "DM policy",                  "Requires your Telegram user IDs"),
-        ("OC05", "Group policy",               "Requires your Telegram user IDs"),
-        ("OC11", "Plaintext API keys",         "Move keys to env vars or secrets manager"),
-        ("OC14", "Heartbeat model routing",    "Requires Ollama installation + config"),
-        ("OC15", "Spending limits",            "Set in your API provider dashboard"),
-        ("OC18", "LAN segmentation",           "VLAN/subnet design for your network"),
-        ("OC19", "Multi-agent isolation",      "Container/VM architecture decision"),
-        ("OC20", "Audit log pipeline",         "SIEM integration for your stack"),
-    ]
-    print("  {}STILL NEEDS AN EXPERT{}".format(C["YELLOW"], C["RESET"]))
-    for check_id, title, reason in manual:
-        print("  {}{}{}  {}  {}--{}  {}{}{}".format(
-            C["DIM"], check_id, C["RESET"], title,
-            C["DIM"], C["RESET"], C["DIM"], reason, C["RESET"]))
-    print("")
-    print("  Schedule a free 30-min call:  {}{}{}".format(C["BOLD"], GRITS_CONSULT, C["RESET"]))
+    # What still needs an expert -- run scanner to get current state
+    _print_expert_items(args.config if args.config else None)
     print("")
     print("-" * 68)
     print("  {}{}{}".format(C["DIM"], GRITS_BRAND, C["RESET"]))

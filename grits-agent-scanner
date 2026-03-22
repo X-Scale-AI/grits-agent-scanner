@@ -73,7 +73,7 @@ OC_LINES = {
     "OC05": ("Anyone in group chats can command your agent without restriction.",
              "Group chat commands restricted to approved users.", False),
     "OC06": ("Full tool access enabled. Prompt injection can abuse every tool.",
-             "Tool access restricted to approved set.", True),
+             "Tool access restricted to approved set.", False),
     "OC07": ("No blocked tools. Agent can write files, run code, browse freely.",
              "Dangerous tools are on the deny list.", True),
     "OC08": ("Elevated execution allowed. Agent could escalate to root access.",
@@ -332,12 +332,12 @@ def _oc_firewall_linux():
             return f
         f.detail = "UFW installed but not active."
         return f
-    ipt = cmd_output("sudo iptables -L OUTPUT -n 2>/dev/null | head -5")
+    ipt = cmd_output("iptables -L OUTPUT -n 2>/dev/null | head -5")
     if ipt and "DROP" in ipt:
         f.passed = True
         f.detail = "iptables OUTPUT chain has DROP policy."
         return f
-    nft = cmd_output("sudo nft list ruleset 2>/dev/null | head -10")
+    nft = cmd_output("nft list ruleset 2>/dev/null | head -10")
     if nft and "drop" in nft.lower():
         f.passed = True
         f.detail = "nftables ruleset has drop rules."
@@ -358,7 +358,7 @@ def _oc_firewall_macos():
             passes.append("stealth mode on")
     else:
         issues.append("Application Firewall disabled")
-    pf = cmd_output("sudo pfctl -s info 2>/dev/null | head -3")
+    pf = cmd_output("pfctl -s info 2>/dev/null | head -3")
     if pf and "enabled" in pf.lower():
         passes.append("pf enabled")
     for app, proc in [("LuLu", "LuLu"), ("Little Snitch", "Little Snitch")]:
@@ -1165,8 +1165,8 @@ def format_terminal(findings, score, rating, source_label, agent_label, timestam
     pass_count = len(findings) - fail_count
     lines.append("-" * 68)
     lines.append("")
-    lines.append("  SCORE   {}/{}   {}   {}{}{}".format(
-        pass_count, len(findings), score_bar(score),
+    lines.append("  SCORE   {}/{}   {}   {}%  {}{}{}".format(
+        pass_count, len(findings), score_bar(score), score,
         C["BOLD"], rating.upper(), C["RESET"]))
     lines.append("")
 
