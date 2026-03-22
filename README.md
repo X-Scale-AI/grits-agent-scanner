@@ -1,55 +1,38 @@
 # GRITS Agent Scanner
 
-**Run your AI agent. Keep control of your machine, your keys, and your cloud bill.**
-
 <p align="center">
   <img src=".github/assets/grits-banner.svg" alt="GRITS Agent Scanner" width="100%">
 </p>
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![GRITS Version](https://img.shields.io/badge/GRITS-v0.3.0-green.svg)](https://github.com/X-Scale-AI/grits-agent-scanner)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)]()
 [![X Scale AI](https://img.shields.io/badge/by-X%20Scale%20AI-black.svg)](https://xscaleai.com)
 
 ---
 
-OpenClaw and NemoClaw are powerful. They are also running on your machine, with
-access to your filesystem, your API keys, and your local network. Out of the box,
-most configs leave real gaps -- gaps that a prompt injection, a rogue plugin, or a
-misconfigured channel can walk right through.
+**Your AI agent has full access to your filesystem, API keys, and local network. Most configs ship insecure by default.**
 
-GRITS Agent Scanner reads your actual config files, scores your security posture
-across 5 layers, and tells you in plain language what each finding means and what to
-do about it. The fixer handles what can be automated. The rest links to a 30-minute
-call.
-
-Nothing is modified until you say so.
+GRITS scans your actual config, scores your posture across 5 security layers, fixes what it can automatically, and tells you exactly what still needs attention. Nothing is modified until you say so. Every change is backed up with a one-command rollback.
 
 ---
 
-## Scan in 30 Seconds
+## Get Your Score in 30 Seconds
 
 ```bash
 git clone https://github.com/X-Scale-AI/grits-agent-scanner.git
 cd grits-agent-scanner
-
-# OpenClaw
 ./grits-agent-scanner
-
-# NVIDIA NemoClaw
-./grits-agent-scanner --agent nemoclaw
 ```
 
-**No dependencies.** Python 3 stdlib only. Works on macOS and Linux.
-
-Example output:
+No dependencies. Python 3 stdlib only. Works on macOS and Linux.
 
 ```
 ====================================================================
   GRITS Agent Scanner  v0.3.0  by X Scale AI
 ====================================================================
 
-  Platform  MACOS
-  Agent     OpenClaw
+  Platform  MACOS  |  Agent  OpenClaw
   Config    /Users/you/.openclaw/openclaw.json
 
   L1 -- NETWORK
@@ -58,18 +41,10 @@ Example output:
   [PASS]  OC03  Gateway locked to this machine only. Other devices cannot reach it.
   [FAIL]  OC18  Agent can reach all devices on your LAN. Data exfiltration possible.
 
-  L2 -- OPERATOR
-  [PASS]  OC04  Only approved users can message your agent.
-  [PASS]  OC05  Group chat commands restricted to approved users.
-
   L3 -- APPLICATION
   [FAIL]  OC06  Full tool access enabled. Prompt injection can abuse every tool.
   [PASS]  OC07  Dangerous tools are on the deny list.
   [PASS]  OC09  Sandbox mode active. Agent workspace is isolated.
-
-  L4 -- OS/SECRETS
-  [PASS]  OC11  No plaintext API keys found in config.
-  [FAIL]  OC12  Secrets file readable by other users. Your API keys are exposed.
 
   L5 -- FINANCIAL
   [FAIL]  OC14  Heartbeat burning expensive cloud API credits for a simple ping.
@@ -88,178 +63,164 @@ Example output:
 
 ---
 
-## Fix What's Broken (Automatically)
+## Fix It
 
 ```bash
-# Preview what would change -- nothing is modified:
+# See every change before anything is touched:
 ./grits-agent-secure
 
-# Apply fixes (backs up everything first, only adds, never replaces):
+# Apply -- backs up first, asks for confirmation:
 ./grits-agent-secure --apply
+
+# Changed your mind? Roll back instantly:
+./grits-agent-secure --rollback
+
+# See all available backups:
+./grits-agent-secure --list-backups
 ```
 
 **Before touching anything, the fixer:**
-1. Shows you every change that will be made
-2. Creates a full backup with a rollback command
-3. Asks for your confirmation
+1. Shows you exactly what will change and what will not
+2. Creates a full timestamped backup of your config, `.env`, and credentials directory
+3. Displays the rollback command
+4. Asks for confirmation
 
-**What the fixer handles automatically:**
+**What gets fixed automatically:**
 
-| Fix | What changes | What stays the same |
+| Fix | What changes | What is never touched |
 |---|---|---|
-| Enable firewall | UFW (Linux) or Application Firewall (macOS) | Existing rules untouched |
-| Block dangerous tools | Appends to deny list | Tools you allow are not removed |
+| Enable firewall | UFW (Linux) or Application Firewall (macOS) | Existing rules |
+| Block dangerous tools | Appends to deny list | Tools you already allow |
 | Enable sandbox mode | Sets `agent.sandbox: true` | All other agent settings |
-| Fix file permissions | `.env` and `credentials/` locked to owner-only | File contents unchanged |
-| Disable dangerous flags | Sets yolo/trustAll/autoApprove to false | Keys stay in config |
+| Fix .env permissions | Locks to 600, root-owned | File contents |
+| Fix credentials dir | Locks to 700, root-owned | Credential contents |
+| Disable bypass flags | Sets yolo/trustAll/autoApprove to false | Keys stay in config |
 
-**To roll back at any time:**
+**Rollback:**
 
 ```bash
-# The fixer shows this command before it does anything:
-cp ~/.openclaw/grits-backups/TIMESTAMP/openclaw.json ~/.openclaw/openclaw.json
+# Restore the most recent backup:
+./grits-agent-secure --rollback
+
+# Restore a specific backup by timestamp:
+./grits-agent-secure --rollback 20260322_143022
+
+# List all backups:
+./grits-agent-secure --list-backups
 ```
+
+Backups live at `~/.openclaw/grits-backups/`. The rollback itself backs up your current state first, so you can always undo the undo.
 
 ---
 
-## The 5-Layer Zero-Trust Model
+## What Gets Checked
 
-<p align="center">
-  <img src=".github/assets/grits-architecture.svg" alt="GRITS 5-Layer Architecture" width="100%">
-</p>
+20 checks across 5 layers. Every result -- pass or fail -- is explained in plain language.
 
-| Layer | Boundary | Threat | Checks |
-|---|---|---|---|
-| 1 Network | Host firewall / egress policy | Agent attacks local infrastructure | OC01, OC02, OC03, OC18 |
-| 2 Operator | Identity verification | Unauthorized users command the agent | OC04, OC05, OC17, OC19 |
-| 3 Application | Tool permissions / sandbox | Agent executes rogue code | OC06, OC07, OC08, OC09, OC10 |
-| 4 OS/Secrets | Credential isolation | Workspace leak exposes API keys | OC11, OC12, OC13, OC20 |
-| 5 Financial | Cost containment | Context bloat or runaway loops drain budget | OC14, OC15, OC16 |
+| Layer | What GRITS checks |
+|---|---|
+| **1 Network** | Host firewall, gateway auth, gateway bind address, LAN exposure |
+| **2 Operator** | DM policy, group policy, CLI availability, multi-agent isolation |
+| **3 Application** | Tool profile, deny list, exec policy, sandbox mode, plugin allowlist |
+| **4 OS/Secrets** | Plaintext API keys, .env permissions, credentials dir, audit logs |
+| **5 Financial** | Heartbeat model routing, spending limits, dangerous bypass flags |
+
+Also supports **NVIDIA NemoClaw**:
+
+```bash
+./grits-agent-scanner --agent nemoclaw
+```
+
+Checks binary scoping (NemoClaw#272), Landlock LSM, seccomp, TLS enforcement, inference cost controls.
 
 ---
 
 ## What Needs an Expert
 
-Some issues cannot be automated -- they require decisions about your infrastructure,
-your identity setup, or your organization's threat model.
+Some findings require decisions about your infrastructure. The fixer lists them explicitly.
 
-| Issue | Why it can't be automated |
+| Issue | Why it cannot be automated |
 |---|---|
 | Network segmentation | VLAN/subnet design specific to your environment |
-| Gateway authentication | You choose the token, policy, and user allowlists |
-| API key migration | You choose the secrets backend (Vault, AWS SM, etc.) |
-| Audit logging | Depends on your SIEM (Datadog, Splunk, Elastic, etc.) |
-| Spending limits | Set at your API provider, varies by vendor |
-| Multi-agent isolation | Architectural decision about trust boundaries |
+| Gateway auth + allowlists | You supply the token and user IDs |
+| API key migration | You choose the secrets backend |
+| Audit logging | Depends on your SIEM |
+| Spending limits | Set at your API provider |
+| Multi-agent isolation | Architectural trust boundary decision |
 
-**[Schedule a free 30-min call](https://xscaleai.com/consult)**
+**[Schedule a free 30-min call with an X Scale AI security engineer](https://xscaleai.com/consult)**
 
 ---
 
 ## Output Formats
 
 ```bash
-# Terminal (default) -- color output, designed for screenshots
-./grits-agent-scanner
-
-# Markdown -- for PRs, wikis, security reports
-./grits-agent-scanner --report > security-report.md
-
-# JSON -- for dashboards, CI/CD, automation
-./grits-agent-scanner --json > scan-results.json
+./grits-agent-scanner                        # terminal, color output
+./grits-agent-scanner --report               # markdown (for PRs, wikis)
+./grits-agent-scanner --json                 # JSON (for CI/CD, dashboards)
+./grits-agent-scanner --agent nemoclaw       # scan NemoClaw instead
+./grits-agent-scanner --config /path/to/file # custom config location
 ```
-
----
-
-## Quick Checklists
-
-Five yes/no checklists, one per layer. Share them with your team.
-
-| Layer | Checklist |
-|---|---|
-| 01 Network | [checklists/01-network-safety.md](checklists/01-network-safety.md) |
-| 02 Operator | [checklists/02-operator-identity.md](checklists/02-operator-identity.md) |
-| 03 Application | [checklists/03-tool-permissions.md](checklists/03-tool-permissions.md) |
-| 04 OS/Secrets | [checklists/04-secrets-exposure.md](checklists/04-secrets-exposure.md) |
-| 05 Financial | [checklists/05-cost-exposure.md](checklists/05-cost-exposure.md) |
-
----
-
-## Hardening Guides
-
-| Agent | Guide | What it covers |
-|---|---|---|
-| OpenClaw | [apply/openclaw/](apply/openclaw/) | 5-Layer Zero-Trust hardening: firewall, identity, tools, secrets, cost |
-| NVIDIA NemoClaw | [apply/nemoclaw/](apply/nemoclaw/) | Binary scoping, filesystem policy, inference cost controls |
 
 ---
 
 ## Reference Configs
 
-Pre-hardened configs ready to diff and apply. See
-[score/configs/install-guide.md](score/configs/install-guide.md) for setup
-instructions including environment variable injection.
+Hardened configs ready to diff and apply. See [`score/configs/install-guide.md`](score/configs/install-guide.md) for environment variable setup.
 
 | Config | What it is |
 |---|---|
-| `score/configs/openclaw.json.default` | Vanilla OpenClaw config |
-| `score/configs/openclaw.json.hardened.linux` | Hardened Linux config |
-| `score/configs/openclaw.json.hardened.mac` | Hardened macOS config |
+| `score/configs/openclaw.json.default` | Vanilla out-of-the-box config |
+| `score/configs/openclaw.json.hardened.linux` | Hardened Linux config (env var placeholders) |
+| `score/configs/openclaw.json.hardened.mac` | Hardened macOS config (env var placeholders) |
 
 ---
 
-## Host Hardening Scripts
+## Hardening Guides
 
-Automated OS-level hardening aligned to CIS Benchmarks and DISA STIGs.
-
-```bash
-# Linux host
-sudo bash tools/harden.sh
-
-# Docker host
-sudo bash tools/harden-docker.sh
-```
-
-Review the configuration section at the top of each script before running.
+| Agent | Guide |
+|---|---|
+| OpenClaw | [`apply/openclaw/hardening-baseline.md`](apply/openclaw/hardening-baseline.md) |
+| NVIDIA NemoClaw | [`apply/nemoclaw/README.md`](apply/nemoclaw/README.md) |
 
 ---
 
-## Attribution Required
+## Quick Checklists
 
-Apache 2.0 licensed. Use, modify, and distribute freely.
+Five yes/no checklists, one per layer. Copy, fill in, share with your team.
 
-One requirement: any use of GRITS scoring output must retain the attribution line:
+| Layer | Checklist |
+|---|---|
+| 01 Network | [`checklists/01-network-safety.md`](checklists/01-network-safety.md) |
+| 02 Operator | [`checklists/02-operator-identity.md`](checklists/02-operator-identity.md) |
+| 03 Application | [`checklists/03-tool-permissions.md`](checklists/03-tool-permissions.md) |
+| 04 OS/Secrets | [`checklists/04-secrets-exposure.md`](checklists/04-secrets-exposure.md) |
+| 05 Financial | [`checklists/05-cost-exposure.md`](checklists/05-cost-exposure.md) |
+
+---
+
+## Attribution
+
+Apache 2.0. Use, modify, and distribute freely.
+
+Any use of GRITS scoring output must retain:
 
 > Scored with GRITS by X Scale AI
 
-See the [NOTICE](NOTICE) file for full attribution requirements.
+See [NOTICE](NOTICE) for full requirements.
 
 ---
 
 ## Built on the GRITS Framework
 
-This scanner implements the [GRITS Framework](https://github.com/X-Scale-AI/GRITS)
--- the governance spec, control catalog, lifecycle model, and compliance mappings
-that define the 5-Layer Zero-Trust model for AI agents.
-
----
-
-## Need Help?
-
-The scanner and fixer are free and open source.
-
-For the issues that require architecture decisions, infrastructure changes, or
-organizational context -- network segmentation, secrets architecture, identity
-setup, audit logging, multi-agent trust boundaries:
-
-**[Schedule a free 30-min call with an X Scale AI security engineer](https://xscaleai.com/consult)**
+This scanner implements the [GRITS Framework](https://github.com/X-Scale-AI/GRITS) -- the governance spec, control catalog, and compliance mappings that define the 5-Layer Zero-Trust model for AI agents.
 
 ---
 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and PRs welcome.
-Report security vulnerabilities per [SECURITY.md](SECURITY.md).
+Vulnerabilities: [SECURITY.md](SECURITY.md).
 
 ---
 

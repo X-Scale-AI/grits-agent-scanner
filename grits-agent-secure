@@ -11,6 +11,9 @@ Hardens your OpenClaw config. Before touching anything it:
 Usage:
   ./grits-agent-secure               # preview mode (nothing changed)
   ./grits-agent-secure --apply       # apply fixes after confirmation
+  ./grits-agent-secure --rollback    # restore most recent backup
+  ./grits-agent-secure --rollback 20260322_143022  # restore specific backup
+  ./grits-agent-secure --list-backups              # show all available backups
   ./grits-agent-secure --config /p   # custom config path
   ./grits-agent-secure --yes         # skip confirmation prompt (CI/scripts)
 
@@ -211,6 +214,99 @@ def rollback_command(backup_dir, config_path):
         return None
     src = backup_dir / "openclaw.json"
     return "cp {} {}".format(src, config_path)
+
+
+def list_backups():
+    """Return sorted list of (timestamp_str, backup_dir_path) tuples, newest first."""
+    backups_root = openclaw_dir() / "grits-backups"
+    if not backups_root.exists():
+        return []
+    entries = []
+    for d in backups_root.iterdir():
+        if d.is_dir() and (d / "openclaw.json").exists():
+            entries.append((d.name, d))
+    entries.sort(key=lambda x: x[0], reverse=True)
+    return entries
+
+
+def do_rollback(timestamp, config_path, skip_confirm):
+    """Restore a backup. timestamp=None means most recent."""
+    banner("ROLLBACK MODE")
+    backups = list_backups()
+
+    if not backups:
+        print("  {}No backups found.{}".format(C["RED"], C["RESET"]))
+        print("  Run ./grits-agent-secure --apply first to create a backup.")
+        print("")
+        return 1
+
+    if timestamp:
+        match = [(ts, d) for ts, d in backups if ts == timestamp]
+        if not match:
+            print("  {}Backup '{}' not found.{}".format(C["RED"], timestamp, C["RESET"]))
+            print("")
+            print("  Available backups:")
+            for ts, d in backups:
+                print("    {}".format(ts))
+            print("")
+            return 1
+        ts, backup_dir = match[0]
+    else:
+        ts, backup_dir = backups[0]
+
+    backup_config = backup_dir / "openclaw.json"
+    target        = config_path or find_openclaw_config()
+
+    print("  {}RESTORING BACKUP{}".format(C["CYAN"], C["RESET"]))
+    print("  From:  {}".format(backup_config))
+    print("  To:    {}".format(target or "NOT FOUND"))
+    print("")
+
+    if target is None:
+        print("  {}No config file found to restore to.{}".format(C["RED"], C["RESET"]))
+        return 1
+
+    # Safety: backup current state before overwriting
+    ts_now     = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    safety_dir = openclaw_dir() / "grits-backups" / "pre-rollback-{}".format(ts_now)
+    try:
+        safety_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(target, safety_dir / "openclaw.json")
+        print("  {}Current config backed up to:{}".format(C["DIM"], C["RESET"]))
+        print("  {}".format(safety_dir))
+        print("")
+    except Exception as e:
+        print("  {}WARNING: could not back up current config: {}{}".format(C["YELLOW"], e, C["RESET"]))
+        print("")
+
+    if not skip_confirm:
+        try:
+            answer = input("  Restore this backup? [y/N]  ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print("")
+            print("  Aborted.")
+            return 0
+        if answer not in ("y", "yes"):
+            print("  Aborted. Nothing was changed.")
+            return 0
+        print("")
+
+    try:
+        shutil.copy2(backup_config, target)
+        print("  {}Restored successfully.{}".format(C["GREEN"], C["RESET"]))
+        print("")
+        print("  Re-scan to verify:")
+        print("  {}./grits-agent-scanner{}".format(C["BOLD"], C["RESET"]))
+    except Exception as e:
+        print("  {}ERROR: {}{}".format(C["RED"], e, C["RESET"]))
+        return 1
+
+    print("")
+    print("-" * 68)
+    print("  {}{}{}".format(C["DIM"], GRITS_BRAND, C["RESET"]))
+    print("=" * 68)
+    print("")
+    return 0
 
 # ---------------------------------------------------------------------------
 # Fix actions
@@ -454,15 +550,41 @@ def main():
         description="GRITS Agent Secure -- hardens your OpenClaw config safely",
         epilog=GRITS_BRAND,
     )
-    parser.add_argument("--config", help="Path to openclaw.json")
-    parser.add_argument("--apply",  action="store_true",
+    parser.add_argument("--config",       help="Path to openclaw.json")
+    parser.add_argument("--apply",        action="store_true",
                         help="Apply fixes (default is preview only)")
-    parser.add_argument("--yes",    action="store_true",
+    parser.add_argument("--rollback",     nargs="?", const="latest", metavar="TIMESTAMP",
+                        help="Restore most recent backup, or a specific backup by timestamp")
+    parser.add_argument("--list-backups", action="store_true",
+                        help="List all available backups")
+    parser.add_argument("--yes",          action="store_true",
                         help="Skip confirmation prompt (for CI/scripts)")
     args = parser.parse_args()
 
-    apply    = args.apply
+    apply     = args.apply
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # --list-backups
+    if args.list_backups:
+        banner("AVAILABLE BACKUPS")
+        backups = list_backups()
+        if not backups:
+            print("  No backups found. Run ./grits-agent-secure --apply first.")
+        else:
+            print("  {}  {}".format("TIMESTAMP".ljust(20), "LOCATION"))
+            print("  " + "-" * 64)
+            for ts, d in backups:
+                print("  {}  {}".format(ts.ljust(20), d))
+            print("")
+            print("  To restore:  ./grits-agent-secure --rollback")
+            print("  Specific:    ./grits-agent-secure --rollback {}".format(backups[0][0]))
+        print("")
+        return
+
+    # --rollback
+    if args.rollback:
+        ts = None if args.rollback == "latest" else args.rollback
+        sys.exit(do_rollback(ts, args.config, args.yes))
 
     config_path  = find_openclaw_config(args.config)
     config       = None
