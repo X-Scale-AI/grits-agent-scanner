@@ -1106,16 +1106,16 @@ def compute_score(findings):
 
 def grade(score):
     if score >= 90: return "Hardened"
-    if score >= 70: return "Progressing"
-    if score >= 50: return "Baseline"
-    if score >= 25: return "Weak"
+    if score >= 80: return "Compliant"
+    if score >= 60: return "Partial"
+    if score >= 40: return "At Risk"
     return "Critical"
 
 def score_bar(score):
     filled = int(score / 5)
     empty  = 20 - filled
     bar    = chr(0x2588) * filled + chr(0x2591) * empty
-    color  = C["GREEN"] if score >= 70 else C["YELLOW"] if score >= 40 else C["RED"]
+    color  = C["GREEN"] if score >= 80 else C["YELLOW"] if score >= 40 else C["RED"]
     return "{}{}{}".format(color, bar, C["RESET"])
 
 # ---------------------------------------------------------------------------
