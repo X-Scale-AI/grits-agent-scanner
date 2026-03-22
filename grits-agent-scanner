@@ -1,0 +1,1308 @@
+#!/usr/bin/env python3
+"""
+grits-agent-scanner  v0.3.0
+
+Reads your AI agent config. Checks 20 security settings across 5 layers.
+Explains what each finding means. Shows what you can fix right now and what
+needs an expert. Nothing is modified. Ever.
+
+Supports: OpenClaw (default), NVIDIA NemoClaw (--agent nemoclaw)
+
+Usage:
+  ./grits-agent-scanner                         # scan OpenClaw, terminal output
+  ./grits-agent-scanner --agent nemoclaw        # scan NemoClaw
+  ./grits-agent-scanner --report                # Markdown output
+  ./grits-agent-scanner --json                  # JSON output
+  ./grits-agent-scanner --config /path/to/file  # custom config path
+
+Scored with GRITS v0.3.0 by X Scale AI
+https://github.com/X-Scale-AI/grits-agent-scanner
+"""
+
+import argparse
+import json
+import os
+import platform
+import re
+import socket
+import stat
+import subprocess
+import sys
+import datetime
+from pathlib import Path
+
+GRITS_VERSION   = "0.3.0"
+GRITS_REPO      = "https://github.com/X-Scale-AI/grits-agent-scanner"
+GRITS_SITE      = "https://xscaleai.com"
+GRITS_CONSULT   = "https://xscaleai.com/consult"
+GRITS_BRAND     = "Scored with GRITS v{} by X Scale AI".format(GRITS_VERSION)
+
+# ---------------------------------------------------------------------------
+# Terminal colors (TTY only, falls back silently)
+# ---------------------------------------------------------------------------
+
+def _colors():
+    if sys.stdout.isatty() and os.environ.get("NO_COLOR") is None:
+        return {
+            "RED":    "\033[91m",
+            "GREEN":  "\033[92m",
+            "YELLOW": "\033[93m",
+            "CYAN":   "\033[96m",
+            "BOLD":   "\033[1m",
+            "DIM":    "\033[2m",
+            "RESET":  "\033[0m",
+        }
+    return {k: "" for k in ["RED", "GREEN", "YELLOW", "CYAN", "BOLD", "DIM", "RESET"]}
+
+C = _colors()
+
+# ---------------------------------------------------------------------------
+# One-liner implications for OpenClaw checks
+# Maps check_id -> (fail_line, pass_line, auto_fixable)
+# ---------------------------------------------------------------------------
+
+OC_LINES = {
+    "OC01": ("No firewall. A compromised agent can reach anything on the internet.",
+             "Firewall active. Outbound connections restricted.", True),
+    "OC02": ("No gateway password. Anyone on your network can control your agent.",
+             "Gateway requires authentication to connect.", False),
+    "OC03": ("Gateway exposed on all interfaces. Anyone on your Wi-Fi can connect.",
+             "Gateway locked to this machine only. Other devices cannot reach it.", False),
+    "OC04": ("Agent accepts commands from anyone. No identity verification.",
+             "Only approved users can message your agent.", False),
+    "OC05": ("Anyone in group chats can command your agent without restriction.",
+             "Group chat commands restricted to approved users.", False),
+    "OC06": ("Full tool access enabled. Prompt injection can abuse every tool.",
+             "Tool access restricted to approved set.", True),
+    "OC07": ("No blocked tools. Agent can write files, run code, browse freely.",
+             "Dangerous tools are on the deny list.", True),
+    "OC08": ("Elevated execution allowed. Agent could escalate to root access.",
+             "Elevated and exec policies are restricted.", False),
+    "OC09": ("No sandbox. Agent can read your entire filesystem including SSH keys.",
+             "Sandbox mode active. Agent workspace is isolated.", True),
+    "OC10": ("No plugin restrictions. Any plugin can load without your approval.",
+             "Plugin allowlist configured. Only approved plugins load.", False),
+    "OC11": ("API keys stored in plaintext. Anyone with file access can steal them.",
+             "No plaintext API keys found in config.", False),
+    "OC12": ("Secrets file readable by other users. Your API keys are exposed.",
+             "Secrets file locked down. Only owner can read it.", True),
+    "OC13": ("Credentials folder exposed. Other users can read your tokens.",
+             "Credentials folder locked down. Only owner can access it.", True),
+    "OC14": ("Heartbeat burning expensive cloud API credits for a simple ping.",
+             "Heartbeat routed to a local or low-cost model.", False),
+    "OC15": ("No spending limits. A runaway agent can drain your entire balance.",
+             "Spending controls are configured.", False),
+    "OC16": ("Safety bypasses enabled. Agent does anything without asking.",
+             "No dangerous runtime flags detected.", True),
+    "OC17": ("OpenClaw CLI not installed. Some audit features unavailable.",
+             "OpenClaw CLI available for security audits.", False),
+    "OC18": ("Agent can reach all devices on your LAN. Data exfiltration possible.",
+             "No unrestricted LAN access detected.", False),
+    "OC19": ("Multiple agents share this machine. No trust boundary between them.",
+             "Single agent instance. No cross-agent risk.", False),
+    "OC20": ("No audit logs. If compromised, no record of what happened.",
+             "Audit logs forwarded to external monitoring.", False),
+}
+
+NC_LINES = {
+    "NC01": ("No policy file. NemoClaw has no active network restrictions.",
+             "Policy file found and loaded.", False),
+    "NC02": ("Network policies lack binary restrictions. Any process can exfiltrate data.",
+             "All network policies have binary-scoped restrictions.", False),
+    "NC03": ("Wildcard endpoints in policy. Agent can reach unintended destinations.",
+             "No wildcard or overly broad endpoint definitions.", False),
+    "NC04": ("Non-TLS endpoints configured. Traffic vulnerable to interception.",
+             "All endpoints enforce TLS.", False),
+    "NC05": ("Filesystem write access exceeds /sandbox and /tmp.",
+             "Write access confined to /sandbox and /tmp.", False),
+    "NC06": ("Sensitive paths not explicitly blocked in policy.",
+             "Sensitive paths (.ssh, .env, .git) explicitly denied.", False),
+    "NC07": ("API keys stored in plaintext on the filesystem.",
+             "No plaintext API keys found in config locations.", False),
+    "NC08": ("Landlock LSM not available. Filesystem policy not kernel-enforced.",
+             "Landlock LSM enabled. Kernel-level filesystem isolation active.", False),
+    "NC09": ("Seccomp not available. No syscall-level process restrictions.",
+             "Seccomp available for syscall filtering.", False),
+    "NC10": ("No inference spending limits. Cloud API costs uncapped.",
+             "Inference cost controls configured.", False),
+    "NC11": ("No local inference fallback. All inference burns cloud API budget.",
+             "Local inference provider detected. Cost routing available.", False),
+    "NC12": ("Blueprint version unpinned. Config drift possible across deployments.",
+             "Blueprint version pinned with minimum version constraints.", False),
+    "NC13": ("Policy presets lack binary scoping (NVIDIA/NemoClaw#272).",
+             "All presets have binary restrictions.", False),
+    "NC14": ("NemoClaw CLI not installed. Sandbox management limited.",
+             "NemoClaw CLI available.", False),
+    "NC15": ("OpenShell CLI not installed. Sandbox orchestration limited.",
+             "OpenShell CLI available.", False),
+    "NC16": ("Agent has unrestricted LAN access. Exfiltration is possible.",
+             "No unrestricted LAN exposure detected.", False),
+    "NC17": ("No audit log forwarding. Compromise cannot be investigated.",
+             "Log forwarding to external system detected.", False),
+}
+
+# ---------------------------------------------------------------------------
+# Platform detection
+# ---------------------------------------------------------------------------
+
+def detect_platform():
+    s = platform.system().lower()
+    if s == "linux":
+        return "linux"
+    elif s == "darwin":
+        return "macos"
+    return "other"
+
+PLATFORM = detect_platform()
+
+# ---------------------------------------------------------------------------
+# Shell helpers
+# ---------------------------------------------------------------------------
+
+def cmd_exists(name):
+    return os.system("which {} > /dev/null 2>&1".format(name)) == 0
+
+def cmd_output(cmd):
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except Exception:
+        return None
+
+def probe_port(host, port, timeout=2):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        result = s.connect_ex((host, port))
+        s.close()
+        return result == 0
+    except Exception:
+        return False
+
+def file_perms(path):
+    try:
+        return oct(stat.S_IMODE(os.stat(path).st_mode))
+    except Exception:
+        return None
+
+def file_owner(path):
+    try:
+        return os.stat(path).st_uid
+    except Exception:
+        return None
+
+# ---------------------------------------------------------------------------
+# JSON5 loader (comments, trailing commas, unquoted keys)
+# ---------------------------------------------------------------------------
+
+def load_json5(path):
+    raw = Path(path).read_text(encoding="utf-8")
+    try:
+        import pyjson5
+        return pyjson5.loads(raw)
+    except ImportError:
+        pass
+    return _json5_fallback(raw)
+
+def _json5_fallback(raw):
+    text = re.sub(r'(?<!:)//.*?$', '', raw, flags=re.MULTILINE)
+    text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
+    text = re.sub(r',\s*([}\]])', r'\1', text)
+    text = re.sub(r'(?<=[{,\n])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r' "\1":', text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+# ---------------------------------------------------------------------------
+# Config discovery
+# ---------------------------------------------------------------------------
+
+def find_openclaw_config(custom_path=None):
+    if custom_path:
+        p = Path(custom_path)
+        return p if p.exists() else None
+    for c in [
+        Path.home() / ".openclaw" / "openclaw.json",
+        Path.home() / ".config" / "openclaw" / "openclaw.json",
+        Path.cwd() / "openclaw.json",
+        Path.cwd() / ".openclaw" / "openclaw.json",
+    ]:
+        if c.exists():
+            return c
+    return None
+
+def openclaw_dir():
+    return Path.home() / ".openclaw"
+
+# ---------------------------------------------------------------------------
+# Network helpers (OS-aware)
+# ---------------------------------------------------------------------------
+
+def get_default_gateway():
+    if PLATFORM == "linux":
+        out = cmd_output("ip route show default 2>/dev/null | awk '/default/{print $3}'")
+        return out.split("\n")[0].strip() if out else None
+    elif PLATFORM == "macos":
+        out = cmd_output("route -n get default 2>/dev/null | awk '/gateway:/{print $2}'")
+        return out.strip() if out else None
+    return None
+
+def get_lan_devices():
+    out = cmd_output("arp -a 2>/dev/null")
+    if not out:
+        return []
+    ips = []
+    for line in out.split("\n"):
+        m = re.search(r'\((\d+\.\d+\.\d+\.\d+)\)', line)
+        if m:
+            ip = m.group(1)
+            if not ip.endswith(".255") and ip != "0.0.0.0":
+                ips.append(ip)
+    return ips
+
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return None
+
+def detect_local_llm():
+    found = []
+    if probe_port("127.0.0.1", 11434):
+        found.append(("Ollama", "localhost:11434"))
+    elif cmd_output("pgrep -x ollama 2>/dev/null"):
+        found.append(("Ollama", "process running"))
+    for proc in ["llama-server", "llama.cpp", "llamafile"]:
+        if cmd_output("pgrep -f {} 2>/dev/null".format(proc)):
+            found.append((proc, "process running"))
+            break
+    if probe_port("127.0.0.1", 1234):
+        found.append(("LM Studio", "localhost:1234"))
+    if probe_port("127.0.0.1", 8000) and cmd_output("pgrep -f vllm 2>/dev/null"):
+        found.append(("vLLM", "localhost:8000"))
+    return found
+
+# ---------------------------------------------------------------------------
+# Finding class
+# ---------------------------------------------------------------------------
+
+class Finding:
+    def __init__(self, layer, layer_name, check_id, title, severity, detail, recommendation):
+        self.layer        = layer
+        self.layer_name   = layer_name
+        self.check_id     = check_id
+        self.title        = title
+        self.severity     = severity
+        self.detail       = detail
+        self.recommendation = recommendation
+        self.passed       = False
+
+    def to_dict(self):
+        return {
+            "layer": self.layer, "layer_name": self.layer_name,
+            "check_id": self.check_id, "title": self.title,
+            "severity": self.severity, "detail": self.detail,
+            "recommendation": self.recommendation, "passed": self.passed,
+        }
+
+# ---------------------------------------------------------------------------
+# OPENCLAW CHECKS -- L1 Network
+# ---------------------------------------------------------------------------
+
+def oc_check_firewall():
+    """OC01: Host firewall active (OS-aware)."""
+    if PLATFORM == "macos":
+        return _oc_firewall_macos()
+    return _oc_firewall_linux()
+
+def _oc_firewall_linux():
+    f = Finding(1, "Network", "OC01", "Host firewall active", "CRITICAL", "",
+                "sudo ufw default deny outgoing && sudo ufw default deny incoming && "
+                "sudo ufw allow out 443/tcp && sudo ufw allow out 53/udp && sudo ufw --force enable")
+    if cmd_exists("ufw"):
+        status = cmd_output("sudo ufw status 2>/dev/null || ufw status 2>/dev/null")
+        if status and "Status: active" in status:
+            f.passed = True
+            f.detail = "UFW active{}.".format(" with deny policy" if "deny" in status.lower() else "")
+            return f
+        f.detail = "UFW installed but not active."
+        return f
+    ipt = cmd_output("sudo iptables -L OUTPUT -n 2>/dev/null | head -5")
+    if ipt and "DROP" in ipt:
+        f.passed = True
+        f.detail = "iptables OUTPUT chain has DROP policy."
+        return f
+    nft = cmd_output("sudo nft list ruleset 2>/dev/null | head -10")
+    if nft and "drop" in nft.lower():
+        f.passed = True
+        f.detail = "nftables ruleset has drop rules."
+        return f
+    f.detail = "No active firewall detected (UFW, iptables, or nftables)."
+    return f
+
+def _oc_firewall_macos():
+    f = Finding(1, "Network", "OC01", "Host firewall active", "CRITICAL", "",
+                "sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on && "
+                "sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setstealthmode on")
+    passes, issues = [], []
+    alf = cmd_output("/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>/dev/null")
+    if alf and "enabled" in alf.lower():
+        passes.append("Application Firewall enabled")
+        stealth = cmd_output("/usr/libexec/ApplicationFirewall/socketfilterfw --getstealthmode 2>/dev/null")
+        if stealth and "enabled" in stealth.lower():
+            passes.append("stealth mode on")
+    else:
+        issues.append("Application Firewall disabled")
+    pf = cmd_output("sudo pfctl -s info 2>/dev/null | head -3")
+    if pf and "enabled" in pf.lower():
+        passes.append("pf enabled")
+    for app, proc in [("LuLu", "LuLu"), ("Little Snitch", "Little Snitch")]:
+        if cmd_output("pgrep -f '{}' 2>/dev/null".format(proc)):
+            passes.append("{} running".format(app))
+    if passes and not any("disabled" in i.lower() for i in issues):
+        f.passed = True
+        f.detail = "; ".join(passes) + "."
+    else:
+        f.detail = "No active firewall. " + "; ".join(issues) + "."
+    return f
+
+def oc_check_gateway_auth(config):
+    """OC02: Gateway requires authentication."""
+    f = Finding(1, "Network", "OC02", "Gateway authentication", "HIGH", "",
+                "Set gateway.auth.mode to 'token' with a strong random token.")
+    if config is None:
+        f.detail = "Config not loaded."
+        return f
+    gw = config.get("gateway", {})
+    auth = gw.get("auth", "")
+    if auth and auth not in ("", "none", "false", "disabled"):
+        f.passed = True
+        f.detail = "Gateway auth configured."
+    else:
+        bind = gw.get("bind", "127.0.0.1")
+        if bind in ("0.0.0.0", "::"):
+            f.severity = "CRITICAL"
+            f.detail = "Gateway bound to {} with no auth. Anyone on the network can command your agent.".format(bind)
+        else:
+            f.detail = "Gateway auth not set. Bound to {} (localhost only mitigates but does not fix).".format(bind)
+    return f
+
+def oc_check_gateway_bind(config):
+    """OC03: Gateway not bound to all interfaces."""
+    f = Finding(1, "Network", "OC03", "Gateway bind address", "HIGH", "",
+                "Set gateway.bind to 'loopback' or '127.0.0.1'. Never bind to 0.0.0.0.")
+    if config is None:
+        f.detail = "Config not loaded."
+        return f
+    bind = config.get("gateway", {}).get("bind", "127.0.0.1")
+    if bind in ("0.0.0.0", "::", ""):
+        f.detail = "Gateway bound to {} (all interfaces). Exposed to LAN/WAN.".format(bind)
+    else:
+        f.passed = True
+        f.detail = "Gateway bound to {}.".format(bind)
+    return f
+
+def oc_check_lan_exposure():
+    """OC18: LAN network segmentation."""
+    f = Finding(1, "Network", "OC18", "LAN network segmentation", "HIGH", "",
+                "Isolate the agent host on a dedicated VLAN or subnet. "
+                "Expert required: xscaleai.com/consult")
+    gateway    = get_default_gateway()
+    lan_devs   = get_lan_devices()
+    local_ip   = get_local_ip()
+    details    = []
+    if gateway:
+        if probe_port(gateway, 80, timeout=1) or probe_port(gateway, 443, timeout=1):
+            details.append("gateway {} reachable".format(gateway))
+        else:
+            details.append("gateway: {}".format(gateway))
+    if lan_devs:
+        others = [ip for ip in lan_devs if ip != gateway]
+        if others:
+            details.append("{} device(s) visible on LAN".format(len(others)))
+    if local_ip:
+        octets = local_ip.split(".")
+        if len(octets) == 4:
+            prefix = ".".join(octets[:3])
+            for t in [prefix + ".1", prefix + ".254"]:
+                if t != local_ip and t != gateway:
+                    if probe_port(t, 80, timeout=1) or probe_port(t, 22, timeout=1):
+                        details.append("LAN services reachable at {}".format(t))
+    if gateway:
+        svc_hits = []
+        for port, svc in [(22, "SSH"), (445, "SMB"), (548, "AFP"), (3389, "RDP"),
+                          (5000, "NAS"), (9090, "Prometheus")]:
+            if probe_port(gateway, port, timeout=1):
+                svc_hits.append("{}({})".format(port, svc))
+        if svc_hits:
+            details.append("gateway services: {}".format(", ".join(svc_hits)))
+    if not details:
+        f.passed = True
+        f.detail = "No LAN exposure detected."
+    else:
+        f.detail = "Unrestricted LAN access -- {}. Compromised agent can reach {} device(s).".format(
+            "; ".join(details), len(lan_devs))
+    return f
+
+# ---------------------------------------------------------------------------
+# OPENCLAW CHECKS -- L2 Operator
+# ---------------------------------------------------------------------------
+
+def oc_check_dm_policy(config):
+    """OC04: DM policy is restrictive."""
+    f = Finding(2, "Operator", "OC04", "DM policy", "CRITICAL", "",
+                "Set dmPolicy to 'allowlist' and define allowFrom for every channel.")
+    if config is None:
+        f.detail = "Config not loaded."
+        return f
+    channels = config.get("channels", config.get("channel", {}))
+    if not isinstance(channels, dict):
+        f.detail = "No channels configured."
+        return f
+    open_ch = []
+    for name, ch in channels.items():
+        if not isinstance(ch, dict):
+            continue
+        dm = ch.get("dmPolicy", ch.get("dm_policy", ""))
+        if isinstance(dm, str) and dm.lower() in ("open", "all", "any", "permissive", "*"):
+            open_ch.append(name)
+        allow_from = ch.get("allowFrom", ch.get("allow_from", None))
+        if allow_from is None and dm.lower() not in ("disabled", "off", "none", "allowlist", "pairing"):
+            open_ch.append("{} (no allowFrom)".format(name))
+    open_ch = list(dict.fromkeys(open_ch))
+    if not open_ch:
+        f.passed = True
+        f.detail = "All channels have restrictive DM policies."
+    else:
+        f.detail = "Open/permissive channels: {}.".format(", ".join(open_ch))
+    return f
+
+def oc_check_group_policy(config):
+    """OC05: Group policy is restrictive."""
+    f = Finding(2, "Operator", "OC05", "Group policy", "HIGH", "",
+                "Set groupPolicy to 'allowlist' with explicit user IDs for every channel.")
+    if config is None:
+        f.detail = "Config not loaded."
+        return f
+    channels = config.get("channels", config.get("channel", {}))
+    if not isinstance(channels, dict):
+        f.detail = "No channels configured."
+        return f
+    open_grp = []
+    for name, ch in channels.items():
+        if not isinstance(ch, dict):
+            continue
+        gp = ch.get("groupPolicy", ch.get("group_policy", ""))
+        if isinstance(gp, str) and gp.lower() in ("open", "all", "any", "permissive", "*"):
+            open_grp.append(name)
+    if not open_grp:
+        f.passed = True
+        f.detail = "Group policies are restrictive across all channels."
+    else:
+        f.detail = "Open group policies: {}.".format(", ".join(open_grp))
+    return f
+
+def oc_check_openclaw_cli():
+    """OC17: OpenClaw CLI available."""
+    f = Finding(2, "Operator", "OC17", "OpenClaw CLI", "LOW", "",
+                "Install OpenClaw CLI for built-in security audits.")
+    if cmd_exists("openclaw"):
+        f.passed = True
+        f.detail = "OpenClaw CLI found on PATH."
+    else:
+        f.detail = "OpenClaw CLI not found on PATH."
+    return f
+
+def oc_check_multi_agent():
+    """OC19: Multi-agent isolation."""
+    f = Finding(2, "Operator", "OC19", "Multi-agent isolation", "MEDIUM", "",
+                "Isolate agents in separate containers or VMs with distinct credential sets. "
+                "Expert required: xscaleai.com/consult")
+    agents = []
+    oc_procs = cmd_output("pgrep -afc openclaw 2>/dev/null")
+    if oc_procs:
+        try:
+            n = int(oc_procs.strip())
+            if n > 1:
+                agents.append("OpenClaw: {} processes".format(n))
+        except ValueError:
+            pass
+    for name, pattern in [("NemoClaw", "nemoclaw"), ("Aider", "aider"), ("Cursor", "cursor")]:
+        cnt = cmd_output("pgrep -fc '{}' 2>/dev/null".format(pattern))
+        if cnt:
+            try:
+                n = int(cnt.strip())
+                if n > 0:
+                    agents.append("{}: {} process(es)".format(name, n))
+            except ValueError:
+                pass
+    if len(agents) > 1:
+        f.detail = "Multiple agent frameworks on this host: {}.".format("; ".join(agents))
+    else:
+        f.passed = True
+        f.detail = "Single agent instance detected."
+    return f
+
+# ---------------------------------------------------------------------------
+# OPENCLAW CHECKS -- L3 Application
+# ---------------------------------------------------------------------------
+
+def oc_check_tool_profile(config):
+    """OC06: Tool profile is not 'full'."""
+    f = Finding(3, "Application", "OC06", "Tool profile", "HIGH", "",
+                "Set tool profile to 'minimal' or 'standard'. Never use 'full' in production.")
+    if config is None:
+        f.detail = "Config not loaded."
+        return f
+    tools = config.get("tools", config.get("toolConfig", {}))
+    if not isinstance(tools, dict):
+        f.passed = True
+        f.detail = "No tools config found (defaults apply)."
+        return f
+    profile = tools.get("profile", tools.get("toolProfile", ""))
+    if isinstance(profile, str) and profile.lower() in ("full", "unrestricted", "all", "*"):
+        f.detail = "Tool profile set to '{}'. Agent has unrestricted tool access.".format(profile)
+    else:
+        f.passed = True
+        f.detail = "Tool profile: '{}'.".format(profile or "default")
+    return f
+
+def oc_check_tool_deny(config):
+    """OC07: Dangerous tools denied."""
+    f = Finding(3, "Application", "OC07", "Tool deny list", "HIGH", "",
+                "Add to deny list: file_write, code_execution, shell_exec, browser_navigate.")
+    if config is None:
+        f.detail = "Config not loaded."
+        return f
+    tools = config.get("tools", config.get("toolConfig", {}))
+    if not isinstance(tools, dict):
+        f.detail = "No tools config found."
+        return f
+    deny = tools.get("deny", tools.get("denyList", tools.get("deny_list", [])))
+    if not isinstance(deny, list):
+        deny = []
+    dangerous  = ["file_write", "code_execution", "shell_exec", "exec", "browser_navigate"]
+    denied_bad = [d for d in dangerous if d in deny]
+    if len(denied_bad) >= 2:
+        f.passed = True
+        f.detail = "Deny list includes: {}.".format(", ".join(denied_bad))
+    elif deny:
+        f.detail = "Deny list exists but missing key tools. Current: {}.".format(", ".join(deny))
+    else:
+        f.detail = "No tool deny list. Agent may access all tools."
+    return f
+
+def oc_check_exec_policy(config):
+    """OC08: Exec/elevated execution restricted."""
+    f = Finding(3, "Application", "OC08", "Exec/elevated policy", "CRITICAL", "",
+                "Set execSecurity to 'restricted' or 'disabled'. Disable elevated unless scoped.")
+    if config is None:
+        f.detail = "Config not loaded."
+        return f
+    tools   = config.get("tools", config.get("toolConfig", {}))
+    if not isinstance(tools, dict):
+        f.passed = True
+        f.detail = "No exec policy set (defaults apply)."
+        return f
+    exec_sec = tools.get("execSecurity", tools.get("exec_security", tools.get("exec", "")))
+    elevated = tools.get("elevated", tools.get("elevatedPolicy", tools.get("elevated_policy", "")))
+    issues   = []
+    if isinstance(exec_sec, str) and exec_sec.lower() in ("open", "unrestricted", "allow", "all", "enabled"):
+        issues.append("execSecurity='{}'".format(exec_sec))
+    if isinstance(elevated, str) and elevated.lower() in ("open", "unrestricted", "allow", "all", "enabled"):
+        issues.append("elevated='{}'".format(elevated))
+    if not issues:
+        f.passed = True
+        f.detail = "Exec: '{}', Elevated: '{}'.".format(exec_sec or "default", elevated or "default")
+    else:
+        f.detail = "Dangerous exec settings: {}.".format(", ".join(issues))
+    return f
+
+def oc_check_sandbox(config):
+    """OC09: Sandbox mode enabled."""
+    f = Finding(3, "Application", "OC09", "Sandbox mode", "HIGH", "",
+                "Set agent.sandbox to true in your openclaw.json.")
+    if config is None:
+        f.detail = "Config not loaded."
+        return f
+    agent   = config.get("agent", config.get("agentDefaults", config.get("agents", {}).get("defaults", {})))
+    if not isinstance(agent, dict):
+        agent = config
+    sandbox = agent.get("sandbox", agent.get("sandboxMode", agent.get("sandbox_mode", None)))
+    if sandbox is True or (isinstance(sandbox, str) and sandbox.lower() in ("true", "strict", "enabled")):
+        f.passed = True
+        f.detail = "Sandbox mode enabled."
+    elif sandbox is False or (isinstance(sandbox, str) and sandbox.lower() in ("false", "disabled", "off")):
+        f.detail = "Sandbox mode explicitly disabled. Agent has full host filesystem access."
+    else:
+        f.detail = "Sandbox mode not set. Check your OpenClaw version defaults."
+    return f
+
+def oc_check_plugins(config):
+    """OC10: Plugin allowlist configured."""
+    f = Finding(3, "Application", "OC10", "Plugin allowlist", "MEDIUM", "",
+                "Set plugins.allow to an explicit list. Remove any wildcard entries.")
+    if config is None:
+        f.detail = "Config not loaded."
+        return f
+    plugins = config.get("plugins", {})
+    if not isinstance(plugins, dict):
+        f.passed = True
+        f.detail = "No plugins configured."
+        return f
+    allow = plugins.get("allow", None)
+    if isinstance(allow, list) and len(allow) > 0:
+        if "*" in allow or "all" in [str(a).lower() for a in allow]:
+            f.detail = "Plugin allow list contains wildcard. All plugins permitted."
+        else:
+            f.passed = True
+            f.detail = "{} plugin(s) explicitly allowed.".format(len(allow))
+    else:
+        f.detail = "No explicit plugin allowlist. Plugins may load without restriction."
+    return f
+
+# ---------------------------------------------------------------------------
+# OPENCLAW CHECKS -- L4 OS/Secrets
+# ---------------------------------------------------------------------------
+
+def oc_check_plaintext_keys(config_path, config):
+    """OC11: No plaintext API keys in config."""
+    f = Finding(4, "OS/Secrets", "OC11", "Plaintext API keys", "CRITICAL", "",
+                "Move API keys to environment variables or a secrets manager. "
+                "See score/configs/install-guide.md for setup instructions.")
+    if config_path is None:
+        f.detail = "No config file found."
+        return f
+    try:
+        raw = Path(config_path).read_text()
+    except Exception:
+        f.detail = "Could not read config file."
+        return f
+    key_patterns = [
+        r'["\']?(?:api[_-]?key|apikey|secret|token|password)["\']?\s*[:=]\s*["\']?(?:sk-|xoxb-|xoxp-|ghp_|gho_|glpat-|AIZA)[A-Za-z0-9_\-]{10,}',
+        r'["\']?(?:ANTHROPIC_API_KEY|OPENAI_API_KEY|SLACK_TOKEN|DISCORD_TOKEN|TELEGRAM_TOKEN)["\']?\s*[:=]\s*["\']?[A-Za-z0-9_\-]{10,}',
+    ]
+    found = []
+    for pat in key_patterns:
+        found.extend(re.findall(pat, raw, re.IGNORECASE))
+    generic = re.findall(
+        r'["\']?(?:key|secret|token|credential|password)["\']?\s*[:=]\s*["\']([A-Za-z0-9_\-]{20,})["\']',
+        raw, re.IGNORECASE)
+    found.extend(generic)
+    if not found:
+        f.passed = True
+        f.detail = "No plaintext API keys detected in config."
+    else:
+        f.detail = "{} potential plaintext key(s) found in config file.".format(len(found))
+    return f
+
+def oc_check_env_perms():
+    """OC12: .env file permissions."""
+    f = Finding(4, "OS/Secrets", "OC12", ".env permissions", "HIGH", "",
+                "Run: sudo chown root:root .env && sudo chmod 600 .env "
+                "(macOS: sudo chown root:wheel .env)")
+    oc_dir = openclaw_dir()
+    checked, issues = [], []
+    for env_path in [oc_dir / ".env", oc_dir / "secrets.env", Path.cwd() / ".env"]:
+        if env_path.exists():
+            checked.append(str(env_path))
+            perms = file_perms(env_path)
+            uid   = file_owner(env_path)
+            if perms and perms not in ("0o600", "0o400"):
+                issues.append("{}: perms={} (need 600)".format(env_path.name, perms))
+            if uid is not None and uid != 0:
+                issues.append("{}: owned by uid {} (need root)".format(env_path.name, uid))
+    if not checked:
+        f.passed = True
+        f.detail = "No .env files found (good if using env injection)."
+    elif not issues:
+        f.passed = True
+        f.detail = "All .env files have restrictive permissions."
+    else:
+        f.detail = "; ".join(issues) + "."
+    return f
+
+def oc_check_creds_dir_perms():
+    """OC13: Credentials directory permissions."""
+    f = Finding(4, "OS/Secrets", "OC13", "Credentials dir permissions", "HIGH", "",
+                "sudo chown -R root:root ~/.openclaw/credentials && sudo chmod 700 ~/.openclaw/credentials "
+                "(macOS: root:wheel)")
+    cred_dir = openclaw_dir() / "credentials"
+    if not cred_dir.exists():
+        f.passed = True
+        f.detail = "No credentials directory found."
+        return f
+    perms  = file_perms(cred_dir)
+    uid    = file_owner(cred_dir)
+    issues = []
+    if perms and perms not in ("0o700", "0o500"):
+        issues.append("dir perms={} (need 700)".format(perms))
+    if uid is not None and uid != 0:
+        issues.append("owned by uid {} (need root)".format(uid))
+    try:
+        for child in cred_dir.iterdir():
+            cp = file_perms(child)
+            if cp and int(cp, 8) & 0o044:
+                issues.append("{} world/group readable ({})".format(child.name, cp))
+    except PermissionError:
+        pass
+    if not issues:
+        f.passed = True
+        f.detail = "Credentials directory has restrictive permissions."
+    else:
+        f.detail = "; ".join(issues) + "."
+    return f
+
+def oc_check_audit_logs():
+    """OC20: Audit log pipeline."""
+    f = Finding(4, "OS/Secrets", "OC20", "Audit log pipeline", "MEDIUM", "",
+                "Forward agent logs to a SIEM (Datadog, Splunk, Elastic). "
+                "Expert required: xscaleai.com/consult")
+    oc_dir    = openclaw_dir()
+    indicators, has_fwd = [], False
+    for loc in [oc_dir / "logs", oc_dir / "log",
+                Path.home() / ".local" / "share" / "openclaw" / "logs"]:
+        if loc.exists():
+            indicators.append("logs at {}".format(loc))
+            break
+    if cmd_output("grep -rl 'openclaw' /etc/rsyslog.d/ 2>/dev/null"):
+        has_fwd = True
+        indicators.append("rsyslog forwarding configured")
+    if cmd_output("systemctl list-units 2>/dev/null | grep -i openclaw"):
+        has_fwd = True
+        indicators.append("systemd unit (journald logging)")
+    for agent_name, proc in [("Datadog", "datadog-agent"), ("Splunk", "splunkd"),
+                               ("Elastic", "filebeat"), ("Fluentd", "fluentd"),
+                               ("Vector", "vector")]:
+        if cmd_output("pgrep -f {} 2>/dev/null".format(proc)):
+            has_fwd = True
+            indicators.append("{} agent running".format(agent_name))
+    if has_fwd:
+        f.passed = True
+        f.detail = "Log forwarding: {}.".format("; ".join(indicators))
+    else:
+        f.detail = "No log forwarding detected. Audit trail is local-only or absent."
+    return f
+
+# ---------------------------------------------------------------------------
+# OPENCLAW CHECKS -- L5 Financial
+# ---------------------------------------------------------------------------
+
+def oc_check_heartbeat(config):
+    """OC14: Heartbeat routes to local/cheap model."""
+    f = Finding(5, "Financial", "OC14", "Heartbeat model routing", "MEDIUM", "",
+                "Configure heartbeat.model to a local Ollama model. "
+                "See score/configs/openclaw.json.hardened.mac for example.")
+    if config is None:
+        f.detail = "Config not loaded."
+        return f
+    agent     = config.get("agents", {}).get("defaults", config.get("agent",
+                config.get("agentDefaults", config.get("defaults", {}))))
+    if not isinstance(agent, dict):
+        agent = config
+    heartbeat = agent.get("heartbeat", None)
+    local_llms = detect_local_llm()
+    if heartbeat is not None:
+        hb_str = str(heartbeat).lower()
+        if any(ind in hb_str for ind in ["ollama", "local", "llama", "phi", "gemma", "tiny", "qwen"]):
+            f.passed = True
+            f.detail = "Heartbeat routed to local model: {}.".format(heartbeat)
+            if local_llms:
+                f.detail += " Confirmed running: {}.".format(", ".join(n for n, _ in local_llms))
+            return f
+        f.detail = "Heartbeat model '{}' may be a cloud model.".format(
+            heartbeat if isinstance(heartbeat, str) else heartbeat.get("model", "unknown"))
+        if local_llms:
+            f.detail += " Local LLM available but unused: {}.".format(
+                ", ".join(n for n, _ in local_llms))
+        return f
+    if local_llms:
+        f.detail = "No heartbeat model set but local LLM detected: {}.".format(
+            ", ".join(n for n, _ in local_llms))
+    else:
+        f.detail = "No heartbeat model configured. Primary (expensive) model used for pings."
+    return f
+
+def oc_check_spending(config):
+    """OC15: Spending limits configured."""
+    f = Finding(5, "Financial", "OC15", "Spending limits", "MEDIUM", "",
+                "Set spending limits in your API provider dashboard. Disable auto-topup.")
+    if config is None:
+        f.detail = "Config not loaded."
+        return f
+    agent = config.get("agents", {}).get("defaults",
+            config.get("agent", config.get("agentDefaults", config.get("defaults", {}))))
+    if not isinstance(agent, dict):
+        agent = config
+    details, has_limit = [], False
+    for key in ["maxTokens", "max_tokens", "maxSpend", "max_spend", "budgetLimit",
+                "budget_limit", "spendingLimit", "spending_limit", "maxContext", "max_context"]:
+        val = agent.get(key)
+        if val is not None:
+            has_limit = True
+            details.append("{}={}".format(key, val))
+    auto_topup = agent.get("autoTopup", agent.get("auto_topup", None))
+    if auto_topup is True or (isinstance(auto_topup, str) and auto_topup.lower() in ("true", "enabled", "on")):
+        f.detail = "Auto-topup is enabled. No spending cap."
+        return f
+    if auto_topup is False or (isinstance(auto_topup, str) and auto_topup.lower() in ("false", "disabled", "off")):
+        has_limit = True
+        details.append("autoTopup=disabled")
+    if has_limit:
+        f.passed = True
+        f.detail = "Cost controls: {}.".format(", ".join(details))
+    else:
+        f.detail = "No spending limits or cost controls found in config."
+    return f
+
+def oc_check_dangerous_flags(config):
+    """OC16: No dangerous runtime flags."""
+    f = Finding(5, "Financial", "OC16", "Dangerous flags", "HIGH", "",
+                "Set dangerouslySkipPermissions, yolo, trustAll, autoApprove to false.")
+    if config is None:
+        f.detail = "Config not loaded."
+        return f
+    dangerous_flags = [
+        "dangerouslySkipPermissions", "dangerously_skip_permissions",
+        "yolo", "yoloMode", "yolo_mode",
+        "trustAll", "trust_all", "trustAllTools",
+        "autoApprove", "auto_approve", "autoApproveAll",
+        "noConfirm", "no_confirm",
+    ]
+    found = []
+    def search(d, prefix=""):
+        if not isinstance(d, dict):
+            return
+        for k, v in d.items():
+            if k in dangerous_flags:
+                if v is True or (isinstance(v, str) and v.lower() in ("true", "enabled", "on", "yes")):
+                    found.append("{}{}={}".format(prefix, k, v))
+            if isinstance(v, dict):
+                search(v, prefix="{}.".format(k))
+    search(config)
+    if not found:
+        f.passed = True
+        f.detail = "No dangerous runtime flags detected."
+    else:
+        f.detail = "Dangerous flags enabled: {}.".format(", ".join(found))
+    return f
+
+# ---------------------------------------------------------------------------
+# RUN OPENCLAW CHECKS
+# ---------------------------------------------------------------------------
+
+def run_openclaw_checks(config_path, config):
+    return [
+        oc_check_firewall(),
+        oc_check_gateway_auth(config),
+        oc_check_gateway_bind(config),
+        oc_check_lan_exposure(),
+        oc_check_dm_policy(config),
+        oc_check_group_policy(config),
+        oc_check_openclaw_cli(),
+        oc_check_multi_agent(),
+        oc_check_tool_profile(config),
+        oc_check_tool_deny(config),
+        oc_check_exec_policy(config),
+        oc_check_sandbox(config),
+        oc_check_plugins(config),
+        oc_check_plaintext_keys(config_path, config),
+        oc_check_env_perms(),
+        oc_check_creds_dir_perms(),
+        oc_check_audit_logs(),
+        oc_check_heartbeat(config),
+        oc_check_spending(config),
+        oc_check_dangerous_flags(config),
+    ]
+
+# ---------------------------------------------------------------------------
+# NEMOCLAW CHECKS (abbreviated -- requires policy file)
+# ---------------------------------------------------------------------------
+
+def load_yaml(path):
+    try:
+        import yaml
+        with open(path, "r") as fh:
+            return yaml.safe_load(fh)
+    except ImportError:
+        return _basic_yaml_parse(path)
+    except Exception:
+        return None
+
+def _basic_yaml_parse(path):
+    data, current_key = {}, None
+    try:
+        with open(path, "r") as fh:
+            for line in fh:
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    continue
+                if ":" in s and not s.startswith("-"):
+                    parts = s.split(":", 1)
+                    k = parts[0].strip()
+                    v = parts[1].strip() if len(parts) > 1 else ""
+                    data[k] = v if v else {}
+                    current_key = k
+    except Exception:
+        return None
+    return data
+
+def find_nemoclaw_root():
+    candidates = [
+        Path.cwd() / "nemoclaw-blueprint",
+        Path.home() / ".nemoclaw",
+        Path("/opt/nemoclaw/nemoclaw-blueprint"),
+    ]
+    npm_root = os.popen("npm root -g 2>/dev/null").read().strip()
+    if npm_root:
+        candidates.append(Path(npm_root) / "nemoclaw" / "nemoclaw-blueprint")
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+def run_nemoclaw_checks(policy_path_arg=None):
+    from pathlib import Path as _P
+    nc_root   = find_nemoclaw_root()
+    pol_path  = None
+    if policy_path_arg:
+        p = _P(policy_path_arg)
+        pol_path = p if p.exists() else None
+    elif nc_root:
+        for candidate in [nc_root / "policies" / "openclaw-sandbox.yaml",
+                          nc_root / "openclaw-sandbox.yaml"]:
+            if candidate.exists():
+                pol_path = candidate
+                break
+    pol_data = load_yaml(pol_path) if pol_path else None
+
+    findings = []
+
+    # NC01 policy exists
+    f = Finding(1, "Network", "NC01", "Policy file exists", "CRITICAL", "",
+                "Ensure openclaw-sandbox.yaml exists in nemoclaw-blueprint/policies/")
+    if pol_path and pol_path.exists():
+        f.passed = True
+        f.detail = "Policy found at {}.".format(pol_path)
+    else:
+        f.detail = "No openclaw-sandbox.yaml found. NemoClaw has no active network policy."
+    findings.append(f)
+
+    # NC02 binary scoping
+    f = Finding(1, "Network", "NC02", "Binary-scoped network policies", "HIGH", "",
+                "Add 'binaries:' restrictions to every network policy entry. See NVIDIA/NemoClaw#272.")
+    net = pol_data.get("network_policies", pol_data.get("network", {})) if pol_data else {}
+    if isinstance(net, dict) and net:
+        unscoped = [n for n, e in net.items() if isinstance(e, dict) and not e.get("binaries")]
+        if not unscoped:
+            f.passed = True
+            f.detail = "All network policy entries have binary restrictions."
+        else:
+            f.detail = "Unscoped entries (any binary can use): {}.".format(", ".join(unscoped))
+    else:
+        f.detail = "No network_policies section in policy."
+    findings.append(f)
+
+    # NC03 wildcard endpoints
+    f = Finding(1, "Network", "NC03", "No wildcard endpoints", "HIGH", "",
+                "Replace wildcard endpoints with explicit host:port pairs.")
+    wildcards = []
+    if isinstance(net, dict):
+        for name, entry in net.items():
+            if isinstance(entry, dict):
+                for ep in entry.get("endpoints", []):
+                    host = ep.get("host", "") if isinstance(ep, dict) else str(ep)
+                    if "*" in str(host) or "0.0.0.0" in str(host):
+                        wildcards.append("{}: {}".format(name, host))
+    if not wildcards:
+        f.passed = True
+        f.detail = "No wildcard endpoints found."
+    else:
+        f.detail = "Wildcard endpoints: {}.".format(", ".join(wildcards))
+    findings.append(f)
+
+    # NC04 TLS
+    f = Finding(1, "Network", "NC04", "TLS enforcement", "MEDIUM", "",
+                "All endpoints should use port 443 (TLS).")
+    non_tls = []
+    if isinstance(net, dict):
+        for name, entry in net.items():
+            if isinstance(entry, dict):
+                for ep in entry.get("endpoints", []):
+                    port = ep.get("port", 443) if isinstance(ep, dict) else 443
+                    if port != 443:
+                        non_tls.append("{}: port {}".format(name, port))
+    if not non_tls:
+        f.passed = True
+        f.detail = "All endpoints use TLS."
+    else:
+        f.detail = "Non-TLS endpoints: {}.".format(", ".join(non_tls))
+    findings.append(f)
+
+    # NC08 Landlock (Linux only)
+    if PLATFORM == "linux":
+        f = Finding(4, "OS/Secrets", "NC08", "Landlock LSM", "HIGH", "",
+                    "NemoClaw requires Linux 5.13+ with Landlock for filesystem isolation.")
+        try:
+            rel = platform.release().split(".")
+            major, minor = int(rel[0]), int(rel[1]) if len(rel) > 1 else 0
+            if major > 5 or (major == 5 and minor >= 13):
+                lsm = Path("/sys/kernel/security/lsm")
+                if lsm.exists() and "landlock" in lsm.read_text():
+                    f.passed = True
+                    f.detail = "Landlock LSM enabled (kernel {}.{}).".format(major, minor)
+                else:
+                    f.detail = "Kernel {}.{} supports Landlock but it is not enabled.".format(major, minor)
+            else:
+                f.detail = "Kernel {}.{} does not support Landlock (requires 5.13+).".format(major, minor)
+        except Exception as e:
+            f.detail = "Could not determine kernel version: {}.".format(e)
+        findings.append(f)
+
+    # NC10 inference costs
+    f = Finding(5, "Financial", "NC10", "Inference cost controls", "MEDIUM", "",
+                "Set up local Ollama fallback. Monitor usage at build.nvidia.com.")
+    f.detail = "NemoClaw has no native spending limits. All inference uses NVIDIA cloud API."
+    findings.append(f)
+
+    # NC11 local inference
+    f = Finding(5, "Financial", "NC11", "Local inference fallback", "LOW", "",
+                "Configure Ollama or vLLM as inference fallback to reduce cloud costs.")
+    local_llms = detect_local_llm()
+    if local_llms:
+        f.passed = True
+        f.detail = "Local LLM detected: {}.".format(", ".join("{} ({})".format(n, d) for n, d in local_llms))
+    else:
+        f.detail = "No local LLM provider detected. All inference burns cloud API budget."
+    findings.append(f)
+
+    # NC16 LAN exposure
+    findings.append(oc_check_lan_exposure())
+    findings[-1].check_id = "NC16"
+
+    # NC17 audit logs
+    findings.append(oc_check_audit_logs())
+    findings[-1].check_id = "NC17"
+
+    return findings
+
+# ---------------------------------------------------------------------------
+# Scoring
+# ---------------------------------------------------------------------------
+
+SEVERITY_WEIGHTS = {"CRITICAL": 15, "HIGH": 10, "MEDIUM": 5, "LOW": 2, "INFO": 0}
+
+def compute_score(findings):
+    max_s  = sum(SEVERITY_WEIGHTS.get(f.severity, 0) for f in findings)
+    if max_s == 0:
+        return 100
+    lost   = sum(SEVERITY_WEIGHTS.get(f.severity, 0) for f in findings if not f.passed)
+    return max(0, min(100, int(((max_s - lost) / max_s) * 100)))
+
+def grade(score):
+    if score >= 90: return "Hardened"
+    if score >= 70: return "Progressing"
+    if score >= 50: return "Baseline"
+    if score >= 25: return "Weak"
+    return "Critical"
+
+def score_bar(score):
+    filled = int(score / 5)
+    empty  = 20 - filled
+    bar    = chr(0x2588) * filled + chr(0x2591) * empty
+    color  = C["GREEN"] if score >= 70 else C["YELLOW"] if score >= 40 else C["RED"]
+    return "{}{}{}".format(color, bar, C["RESET"])
+
+# ---------------------------------------------------------------------------
+# Output formatters
+# ---------------------------------------------------------------------------
+
+def format_terminal(findings, score, rating, source_label, agent_label, timestamp):
+    lines_check = OC_LINES if agent_label == "OpenClaw" else NC_LINES
+    lines = []
+    lines.append("")
+    lines.append("{}{}{}".format(C["BOLD"], "=" * 68, C["RESET"]))
+    lines.append("{}  GRITS Agent Scanner  v{}  by X Scale AI{}".format(C["BOLD"], GRITS_VERSION, C["RESET"]))
+    lines.append("=" * 68)
+    lines.append("")
+    lines.append("  {}WHAT THIS TOOL DOES{}".format(C["DIM"], C["RESET"]))
+    lines.append("  {}Reads your config. Checks security. Reports findings.{}".format(C["DIM"], C["RESET"]))
+    lines.append("  {}Nothing is modified. Ever.{}".format(C["DIM"], C["RESET"]))
+    lines.append("")
+    lines.append("  Platform  {}".format(PLATFORM.upper()))
+    lines.append("  Agent     {}".format(agent_label))
+    lines.append("  Config    {}".format(source_label))
+    lines.append("  Scanned   {}".format(timestamp))
+    lines.append("")
+    lines.append("-" * 68)
+    lines.append("")
+
+    layers = {}
+    for f in findings:
+        key = "L{} -- {}".format(f.layer, f.layer_name.upper())
+        layers.setdefault(key, []).append(f)
+
+    for layer_key in sorted(layers.keys()):
+        lines.append("  {}{}{}".format(C["BOLD"] + C["CYAN"], layer_key, C["RESET"]))
+        for f in layers[layer_key]:
+            entry = lines_check.get(f.check_id)
+            if f.passed:
+                msg  = entry[1] if entry else f.title
+                icon = "{}[PASS]{}".format(C["GREEN"], C["RESET"])
+            else:
+                msg  = entry[0] if entry else f.detail
+                icon = "{}[FAIL]{}".format(C["RED"], C["RESET"])
+            lines.append("  {}  {}{}  {}{}".format(
+                icon, C["DIM"], f.check_id, C["RESET"], msg))
+        lines.append("")
+
+    fail_count = sum(1 for f in findings if not f.passed)
+    pass_count = len(findings) - fail_count
+    lines.append("-" * 68)
+    lines.append("")
+    lines.append("  SCORE   {}/{}   {}   {}{}{}".format(
+        pass_count, len(findings), score_bar(score),
+        C["BOLD"], rating.upper(), C["RESET"]))
+    lines.append("")
+
+    if fail_count > 0:
+        fixable = [f for f in findings if not f.passed
+                   and (OC_LINES.get(f.check_id) or NC_LINES.get(f.check_id, (None, None, False)))[2] == True]
+        expert  = [f for f in findings if not f.passed
+                   and (OC_LINES.get(f.check_id) or NC_LINES.get(f.check_id, (None, None, False)))[2] != True]
+
+        if fixable:
+            lines.append("  {}AUTO-FIXABLE NOW ({} issue{}){}".format(
+                C["YELLOW"], len(fixable), "s" if len(fixable) != 1 else "", C["RESET"]))
+            lines.append("  Run:  {}./grits-agent-secure{}".format(C["BOLD"], C["RESET"]))
+            lines.append("")
+        if expert:
+            lines.append("  {}NEEDS AN EXPERT ({} issue{}){}".format(
+                C["RED"], len(expert), "s" if len(expert) != 1 else "", C["RESET"]))
+            for f in expert:
+                entry = lines_check.get(f.check_id)
+                msg = entry[0] if entry else f.detail
+                lines.append("  {}{}{}  {}{}".format(C["DIM"], f.check_id, C["RESET"], msg, ""))
+            lines.append("")
+            lines.append("  Schedule a free 30-min call:  {}{}{}".format(C["BOLD"], GRITS_CONSULT, C["RESET"]))
+            lines.append("")
+
+    lines.append("-" * 68)
+    lines.append("  {}{}{}".format(C["DIM"], GRITS_BRAND, C["RESET"]))
+    lines.append("  {}{}{}".format(C["DIM"], GRITS_REPO, C["RESET"]))
+    lines.append("=" * 68)
+    lines.append("")
+    return "\n".join(lines)
+
+
+def format_markdown(findings, score, rating, source_label, agent_label, timestamp):
+    lines_check = OC_LINES if agent_label == "OpenClaw" else NC_LINES
+    lines = []
+    lines.append("# GRITS Agent Scanner -- {} Report".format(agent_label))
+    lines.append("")
+    lines.append("| | |")
+    lines.append("|---|---|")
+    lines.append("| **Scanned** | {} |".format(timestamp))
+    lines.append("| **Agent** | {} |".format(agent_label))
+    lines.append("| **Config** | {} |".format(source_label))
+    lines.append("| **Score** | {}% -- {} |".format(score, rating))
+    lines.append("")
+    lines.append("## Findings")
+    lines.append("")
+    lines.append("| Layer | ID | Result | Implication |")
+    lines.append("|---|---|---|---|")
+    for f in findings:
+        entry  = lines_check.get(f.check_id)
+        status = "PASS" if f.passed else "FAIL"
+        msg    = (entry[1] if f.passed else entry[0]) if entry else (f.title if f.passed else f.detail)
+        lines.append("| L{} {} | {} | {} | {} |".format(f.layer, f.layer_name, f.check_id, status, msg))
+    lines.append("")
+    fail_count = sum(1 for f in findings if not f.passed)
+    pass_count = len(findings) - fail_count
+    lines.append("**{} passed, {} failed**".format(pass_count, fail_count))
+    lines.append("")
+    fixable = [f for f in findings if not f.passed
+               and (OC_LINES.get(f.check_id) or NC_LINES.get(f.check_id, (None, None, False)))[2] == True]
+    if fixable:
+        lines.append("## Auto-fixable ({} issue{})".format(len(fixable), "s" if len(fixable) != 1 else ""))
+        lines.append("")
+        lines.append("```bash")
+        lines.append("./grits-agent-secure")
+        lines.append("```")
+        lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("*{}*".format(GRITS_BRAND))
+    lines.append("*{}*".format(GRITS_REPO))
+    return "\n".join(lines)
+
+
+def format_json(findings, score, rating, source_label, agent_label, timestamp):
+    return json.dumps({
+        "grits_version": GRITS_VERSION,
+        "timestamp": timestamp,
+        "agent": agent_label,
+        "config": source_label,
+        "platform": PLATFORM,
+        "score": score,
+        "rating": rating,
+        "pass_count": sum(1 for f in findings if f.passed),
+        "fail_count": sum(1 for f in findings if not f.passed),
+        "findings": [f.to_dict() for f in findings],
+        "attribution": GRITS_BRAND,
+        "repo": GRITS_REPO,
+    }, indent=2)
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="GRITS Agent Scanner -- security posture for AI agents",
+        epilog=GRITS_BRAND,
+    )
+    parser.add_argument("--agent", default="openclaw",
+                        choices=["openclaw", "nemoclaw"],
+                        help="Agent to scan (default: openclaw)")
+    parser.add_argument("--config", help="Path to config/policy file")
+    parser.add_argument("--report", action="store_true", help="Markdown output")
+    parser.add_argument("--json",   action="store_true", help="JSON output")
+    args = parser.parse_args()
+
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    if args.agent == "openclaw":
+        config_path   = find_openclaw_config(args.config)
+        config        = None
+        source_label  = str(config_path) if config_path else "NOT FOUND"
+        if config_path:
+            try:
+                config = load_json5(config_path)
+            except Exception:
+                pass
+        findings     = run_openclaw_checks(config_path, config)
+        agent_label  = "OpenClaw"
+    else:
+        findings     = run_nemoclaw_checks(args.config)
+        source_label = args.config or "auto-detected"
+        agent_label  = "NVIDIA NemoClaw"
+
+    score    = compute_score(findings)
+    rating   = grade(score)
+
+    if args.json:
+        print(format_json(findings, score, rating, source_label, agent_label, timestamp))
+    elif args.report:
+        print(format_markdown(findings, score, rating, source_label, agent_label, timestamp))
+    else:
+        print(format_terminal(findings, score, rating, source_label, agent_label, timestamp))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,197 @@
+{
+  "meta": {
+    "lastTouchedVersion": "2026.3.2",
+    "lastTouchedAt": "2026-03-07T23:01:58.004Z"
+  },
+  "wizard": {
+    "lastRunAt": "2026-03-07T23:01:57.987Z",
+    "lastRunVersion": "2026.3.2",
+    "lastRunCommand": "doctor",
+    "lastRunMode": "local"
+  },
+  "auth": {
+    "profiles": {
+      "openrouter:default": {
+        "provider": "openrouter",
+        "mode": "api_key"
+      }
+    }
+  },
+  "models": {
+    "mode": "merge",
+    "providers": {
+      "custom-127-0-0-1-11434": {
+        "baseUrl": "http://127.0.0.1:11434",
+        "apiKey": "ollama-local",
+        "api": "ollama",
+        "models": [
+          {
+            "id": "qwen3:8b",
+            "name": "qwen3:8b (Custom Provider)",
+            "reasoning": false,
+            "input": [
+              "text"
+            ],
+            "cost": {
+              "input": 0,
+              "output": 0,
+              "cacheRead": 0,
+              "cacheWrite": 0
+            },
+            "contextWindow": 16384,
+            "maxTokens": 1536
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "custom-127-0-0-1-11434/qwen3:8b",
+        "fallbacks": [
+          "openrouter/google/gemini-3-flash-preview",
+          "openrouter/anthropic/claude-sonnet-4-5"
+        ]
+      },
+      "imageModel": {
+        "primary": "openrouter/google/gemini-3.1-flash-image-preview",
+        "fallbacks": [
+          "openrouter/google/gemini-2.5-flash-image-preview"
+        ]
+      },
+      "models": {
+        "custom-127-0-0-1-11434/qwen3:8b": {
+          "alias": "local",
+          "params": {
+            "temperature": 0.2,
+            "maxTokens": 1200
+          }
+        },
+        "openrouter/google/gemini-3-flash-preview": {
+          "alias": "gemini-flash",
+          "params": {
+            "temperature": 0.2,
+            "maxTokens": 2200
+          }
+        },
+        "openrouter/anthropic/claude-sonnet-4-5": {
+          "alias": "sonnet",
+          "params": {
+            "temperature": 0.2,
+            "maxTokens": 3200
+          }
+        },
+        "openrouter/google/gemini-3.1-flash-image-preview": {
+          "alias": "gemini-image"
+        },
+        "openrouter/google/gemini-2.5-flash-image-preview": {
+          "alias": "gemini-image-lite"
+        }
+      },
+      "workspace": "/Users/kzee/.openclaw/workspace",
+      "bootstrapMaxChars": 4000,
+      "bootstrapTotalMaxChars": 12000,
+      "userTimezone": "America/Chicago",
+      "memorySearch": {
+        "enabled": true,
+        "provider": "ollama",
+        "model": "nomic-embed-text"
+      },
+      "contextPruning": {
+        "mode": "cache-ttl",
+        "ttl": "50m",
+        "keepLastAssistants": 3,
+        "softTrimRatio": 0.3,
+        "hardClearRatio": 0.5,
+        "minPrunableToolChars": 50000,
+        "tools": {
+          "deny": [
+            "browser",
+            "canvas"
+          ]
+        },
+        "softTrim": {
+          "maxChars": 4000,
+          "headChars": 1500,
+          "tailChars": 1500
+        },
+        "hardClear": {
+          "enabled": true,
+          "placeholder": "[Old tool result content cleared]"
+        }
+      },
+      "compaction": {
+        "mode": "safeguard"
+      },
+      "thinkingDefault": "off",
+      "verboseDefault": "off",
+      "imageMaxDimensionPx": 1000,
+      "heartbeat": {
+        "every": "30m",
+        "model": "custom-127-0-0-1-11434/qwen3:8b",
+        "session": "main",
+        "includeReasoning": false,
+        "target": "none",
+        "prompt": "Read HEARTBEAT.md if it exists. Check only for real blockers, stuck work, or required follow-up. Keep the turn minimal. If nothing needs attention, reply exactly: HEARTBEAT_OK",
+        "ackMaxChars": 120,
+        "suppressToolErrorWarnings": true
+      },
+      "maxConcurrent": 2,
+      "subagents": {
+        "maxConcurrent": 2
+      }
+    }
+  },
+  "tools": {
+    "profile": "full",
+    "web": {
+      "search": {
+        "enabled": true,
+        "apiKey": "${BRAVE_API_KEY}"
+      },
+      "fetch": {
+        "enabled": true
+      }
+    },
+    "deny": [
+      "file_write",
+      "code_execution",
+      "shell_exec",
+      "browser_navigate"
+    ]
+  },
+  "commands": {
+    "native": "auto",
+    "nativeSkills": "auto",
+    "restart": true,
+    "ownerDisplay": "raw"
+  },
+  "session": {
+    "dmScope": "per-channel-peer"
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "dmPolicy": "pairing",
+      "groupPolicy": "allowlist",
+      "streaming": "partial"
+    }
+  },
+  "gateway": {
+    "port": 18789,
+    "mode": "local",
+    "bind": "loopback",
+    "auth": {
+      "mode": "token",
+      "token": "${OPENCLAW_GATEWAY_TOKEN}"
+    },
+    "tailscale": {
+      "mode": "off",
+      "resetOnExit": false
+    }
+  },
+  "agent": {
+    "sandbox": true
+  }
+}

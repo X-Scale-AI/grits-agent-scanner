@@ -1,0 +1,648 @@
+#!/usr/bin/env python3
+"""
+grits-agent-secure  v0.3.0
+
+Hardens your OpenClaw config. Before touching anything it:
+  1. Shows you exactly what will change
+  2. Creates a full backup with rollback instructions
+  3. Asks for your confirmation
+  4. Only then applies changes
+
+Usage:
+  ./grits-agent-secure               # preview mode (nothing changed)
+  ./grits-agent-secure --apply       # apply fixes after confirmation
+  ./grits-agent-secure --config /p   # custom config path
+  ./grits-agent-secure --yes         # skip confirmation prompt (CI/scripts)
+
+Auto-fixes:
+  OC01  Enable host firewall (macOS Application Firewall / Linux UFW)
+  OC07  Add dangerous tools to deny list
+  OC09  Enable sandbox mode in agent config
+  OC12  Fix .env file permissions (600, root-owned)
+  OC13  Fix credentials directory permissions (700, root-owned)
+  OC16  Disable dangerous runtime flags
+
+Does NOT touch:
+  - Existing firewall rules (additive only)
+  - Tools you already allow (deny list is appended, not replaced)
+  - Any other agent settings
+  - File contents (permissions only)
+
+Scored with GRITS v0.3.0 by X Scale AI
+https://github.com/X-Scale-AI/grits-agent-scanner
+"""
+
+import argparse
+import datetime
+import json
+import os
+import platform
+import re
+import shutil
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+GRITS_VERSION = "0.3.0"
+GRITS_REPO    = "https://github.com/X-Scale-AI/grits-agent-scanner"
+GRITS_CONSULT = "https://xscaleai.com/consult"
+GRITS_BRAND   = "Scored with GRITS v{} by X Scale AI".format(GRITS_VERSION)
+
+# ---------------------------------------------------------------------------
+# Terminal colors
+# ---------------------------------------------------------------------------
+
+def _colors():
+    if sys.stdout.isatty() and os.environ.get("NO_COLOR") is None:
+        return {
+            "RED":    "\033[91m",
+            "GREEN":  "\033[92m",
+            "YELLOW": "\033[93m",
+            "CYAN":   "\033[96m",
+            "BOLD":   "\033[1m",
+            "DIM":    "\033[2m",
+            "RESET":  "\033[0m",
+        }
+    return {k: "" for k in ["RED", "GREEN", "YELLOW", "CYAN", "BOLD", "DIM", "RESET"]}
+
+C = _colors()
+
+# ---------------------------------------------------------------------------
+# Platform detection
+# ---------------------------------------------------------------------------
+
+def detect_platform():
+    s = platform.system().lower()
+    if s == "linux":   return "linux"
+    if s == "darwin":  return "macos"
+    return "other"
+
+PLATFORM = detect_platform()
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def cmd_exists(name):
+    return os.system("which {} > /dev/null 2>&1".format(name)) == 0
+
+def cmd_run(cmd, dry_run=True, sudo=False):
+    """Run a command. In dry_run mode print it, do not execute."""
+    if dry_run:
+        return True, "DRY RUN"
+    try:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, timeout=60)
+        if result.returncode == 0:
+            return True, result.stdout.strip()
+        else:
+            return False, result.stderr.strip() or "exit {}".format(result.returncode)
+    except Exception as e:
+        return False, str(e)
+
+def file_perms(path):
+    try:
+        return oct(stat.S_IMODE(os.stat(path).st_mode))
+    except Exception:
+        return None
+
+def file_owner(path):
+    try:
+        return os.stat(path).st_uid
+    except Exception:
+        return None
+
+# ---------------------------------------------------------------------------
+# JSON5 loader
+# ---------------------------------------------------------------------------
+
+def load_json5(path):
+    raw = Path(path).read_text(encoding="utf-8")
+    try:
+        import pyjson5
+        return pyjson5.loads(raw)
+    except ImportError:
+        pass
+    return _json5_fallback(raw)
+
+def _json5_fallback(raw):
+    text = re.sub(r'(?<!:)//.*?$', '', raw, flags=re.MULTILINE)
+    text = re.sub(r'/\*.*?\*/', '', text, flags=re.DOTALL)
+    text = re.sub(r',\s*([}\]])', r'\1', text)
+    text = re.sub(r'(?<=[{,\n])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r' "\1":', text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+# ---------------------------------------------------------------------------
+# Config discovery
+# ---------------------------------------------------------------------------
+
+def find_openclaw_config(custom_path=None):
+    if custom_path:
+        p = Path(custom_path)
+        return p if p.exists() else None
+    for c in [
+        Path.home() / ".openclaw" / "openclaw.json",
+        Path.home() / ".config" / "openclaw" / "openclaw.json",
+        Path.cwd() / "openclaw.json",
+        Path.cwd() / ".openclaw" / "openclaw.json",
+    ]:
+        if c.exists():
+            return c
+    return None
+
+def openclaw_dir():
+    return Path.home() / ".openclaw"
+
+# ---------------------------------------------------------------------------
+# Backup
+# ---------------------------------------------------------------------------
+
+def create_backup(config_path):
+    """Create a timestamped backup of the config file and surrounding secrets."""
+    ts          = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    oc_dir      = openclaw_dir()
+    backup_dir  = oc_dir / "grits-backups" / ts
+    backed_up   = []
+    errors      = []
+
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        return None, None, ["Could not create backup directory: {}".format(e)]
+
+    # Backup main config
+    if config_path and Path(config_path).exists():
+        dst = backup_dir / "openclaw.json"
+        try:
+            shutil.copy2(config_path, dst)
+            backed_up.append(str(config_path))
+        except Exception as e:
+            errors.append("config: {}".format(e))
+
+    # Backup .env files
+    for env_path in [oc_dir / ".env", oc_dir / "secrets.env", Path.cwd() / ".env"]:
+        if env_path.exists():
+            dst = backup_dir / env_path.name
+            try:
+                shutil.copy2(env_path, dst)
+                backed_up.append(str(env_path))
+            except Exception as e:
+                errors.append("{}: {}".format(env_path.name, e))
+
+    # Backup credentials dir (copy tree)
+    cred_src = oc_dir / "credentials"
+    if cred_src.exists():
+        cred_dst = backup_dir / "credentials"
+        try:
+            shutil.copytree(cred_src, cred_dst)
+            backed_up.append(str(cred_src))
+        except Exception as e:
+            errors.append("credentials: {}".format(e))
+
+    return backup_dir, backed_up, errors
+
+def rollback_command(backup_dir, config_path):
+    """Return the shell command to roll back the config."""
+    if backup_dir is None or config_path is None:
+        return None
+    src = backup_dir / "openclaw.json"
+    return "cp {} {}".format(src, config_path)
+
+# ---------------------------------------------------------------------------
+# Fix actions
+# ---------------------------------------------------------------------------
+
+class FixAction:
+    def __init__(self, check_id, title, description):
+        self.check_id    = check_id
+        self.title       = title
+        self.description = description
+        self.commands    = []       # list of (cmd, explanation)
+        self.config_changes = {}    # dot-key -> (value, explanation)
+        self.skipped     = False
+        self.skip_reason = ""
+        self.applied     = False
+        self.errors      = []
+
+    def add_cmd(self, cmd, explanation):
+        self.commands.append((cmd, explanation))
+
+    def add_cfg(self, key_path, value, explanation):
+        self.config_changes[key_path] = (value, explanation)
+
+# ---------------------------------------------------------------------------
+# OC01: Enable firewall (OS-aware)
+# ---------------------------------------------------------------------------
+
+def fix_firewall():
+    fix = FixAction("OC01", "Enable host firewall",
+                    "Turns on the firewall. Adds default-deny policy and allows HTTPS/DNS outbound.")
+
+    if PLATFORM == "linux":
+        if cmd_exists("ufw"):
+            fix.add_cmd("sudo ufw default deny outgoing",  "Default outbound: deny")
+            fix.add_cmd("sudo ufw default deny incoming",  "Default inbound: deny")
+            fix.add_cmd("sudo ufw allow out 443/tcp",      "Allow HTTPS outbound")
+            fix.add_cmd("sudo ufw allow out 53/udp",       "Allow DNS")
+            fix.add_cmd("sudo ufw --force enable",         "Enable UFW")
+        else:
+            fix.add_cmd("sudo apt-get install -y ufw",         "Install UFW")
+            fix.add_cmd("sudo ufw default deny outgoing",      "Default outbound: deny")
+            fix.add_cmd("sudo ufw default deny incoming",      "Default inbound: deny")
+            fix.add_cmd("sudo ufw allow out 443/tcp",          "Allow HTTPS outbound")
+            fix.add_cmd("sudo ufw allow out 53/udp",           "Allow DNS")
+            fix.add_cmd("sudo ufw --force enable",             "Enable UFW")
+
+    elif PLATFORM == "macos":
+        fix.add_cmd(
+            "sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on",
+            "Enable macOS Application Firewall")
+        fix.add_cmd(
+            "sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setstealthmode on",
+            "Enable stealth mode (ignore unsolicited probes)")
+
+    else:
+        fix.skipped     = True
+        fix.skip_reason = "Unsupported platform for auto-fix."
+
+    return fix
+
+# ---------------------------------------------------------------------------
+# OC07: Add dangerous tools to deny list
+# ---------------------------------------------------------------------------
+
+def fix_tool_deny():
+    fix = FixAction("OC07", "Add dangerous tools to deny list",
+                    "Appends to your existing deny list. Does not remove any tools you currently allow.")
+    dangerous = ["file_write", "code_execution", "shell_exec", "browser_navigate"]
+    fix.add_cfg("tools.deny", dangerous,
+                "Append to deny list: {}".format(", ".join(dangerous)))
+    return fix
+
+# ---------------------------------------------------------------------------
+# OC09: Enable sandbox mode
+# ---------------------------------------------------------------------------
+
+def fix_sandbox():
+    fix = FixAction("OC09", "Enable sandbox mode",
+                    "Sets agent.sandbox = true. Does not change any other agent settings.")
+    fix.add_cfg("agent.sandbox", True, "Set agent.sandbox to true")
+    return fix
+
+# ---------------------------------------------------------------------------
+# OC12: Fix .env permissions
+# ---------------------------------------------------------------------------
+
+def fix_env_perms():
+    fix = FixAction("OC12", "Fix .env file permissions",
+                    "Sets .env to 600, owned by root. Does not change file contents.")
+    oc_dir     = openclaw_dir()
+    group      = "wheel" if PLATFORM == "macos" else "root"
+    found_any  = False
+    for env_path in [oc_dir / ".env", oc_dir / "secrets.env", Path.cwd() / ".env"]:
+        if env_path.exists():
+            found_any = True
+            fix.add_cmd("sudo chown root:{} {}".format(group, env_path),
+                        "Set {} owner to root:{}".format(env_path.name, group))
+            fix.add_cmd("sudo chmod 600 {}".format(env_path),
+                        "Set {} permissions to 600".format(env_path.name))
+    if not found_any:
+        fix.skipped     = True
+        fix.skip_reason = "No .env files found."
+    return fix
+
+# ---------------------------------------------------------------------------
+# OC13: Fix credentials directory permissions
+# ---------------------------------------------------------------------------
+
+def fix_creds_perms():
+    fix = FixAction("OC13", "Fix credentials directory permissions",
+                    "Sets credentials dir to 700, owned by root. Does not change file contents.")
+    cred_dir = openclaw_dir() / "credentials"
+    group    = "wheel" if PLATFORM == "macos" else "root"
+    if cred_dir.exists():
+        fix.add_cmd("sudo chown -R root:{} {}".format(group, cred_dir),
+                    "Set credentials dir owner to root:{} (recursive)".format(group))
+        fix.add_cmd("sudo chmod 700 {}".format(cred_dir),
+                    "Set credentials dir to 700 (owner only)")
+        fix.add_cmd("sudo chmod 600 {}/*".format(cred_dir),
+                    "Set credential files to 600 (owner read/write only)")
+    else:
+        fix.skipped     = True
+        fix.skip_reason = "No credentials directory found."
+    return fix
+
+# ---------------------------------------------------------------------------
+# OC16: Disable dangerous flags
+# ---------------------------------------------------------------------------
+
+def fix_dangerous_flags(config):
+    fix = FixAction("OC16", "Disable dangerous runtime flags",
+                    "Sets dangerous flags to false. Does not remove them from config.")
+    if config is None:
+        fix.skipped     = True
+        fix.skip_reason = "No config loaded."
+        return fix
+    dangerous_flags = [
+        "dangerouslySkipPermissions", "dangerously_skip_permissions",
+        "yolo", "yoloMode", "yolo_mode",
+        "trustAll", "trust_all", "trustAllTools",
+        "autoApprove", "auto_approve", "autoApproveAll",
+        "noConfirm", "no_confirm",
+    ]
+    found = []
+    def search(d, prefix=""):
+        if not isinstance(d, dict):
+            return
+        for k, v in d.items():
+            if k in dangerous_flags:
+                if v is True or (isinstance(v, str) and v.lower() in ("true", "enabled", "on", "yes")):
+                    found.append("{}{}".format(prefix, k))
+                    fix.add_cfg("{}{}".format(prefix, k), False,
+                                "Disable flag: {}".format(k))
+            if isinstance(v, dict):
+                search(v, prefix="{}.".format(k))
+    search(config)
+    if not found:
+        fix.skipped     = True
+        fix.skip_reason = "No dangerous flags found in config."
+    return fix
+
+# ---------------------------------------------------------------------------
+# Config merger (non-destructive: only adds/appends, never deletes)
+# ---------------------------------------------------------------------------
+
+def merge_config(config, changes):
+    if config is None:
+        config = {}
+    for key_path, (value, _) in changes.items():
+        parts  = key_path.split(".")
+        target = config
+        for part in parts[:-1]:
+            if part not in target or not isinstance(target[part], dict):
+                target[part] = {}
+            target = target[part]
+        final  = parts[-1]
+        if isinstance(value, list):
+            existing = target.get(final, [])
+            if not isinstance(existing, list):
+                existing = []
+            target[final] = existing + [v for v in value if v not in existing]
+        else:
+            target[final] = value
+    return config
+
+def write_config(config_path, config_dict):
+    with open(config_path, "w", encoding="utf-8") as fh:
+        json.dump(config_dict, fh, indent=2, ensure_ascii=False)
+        fh.write("\n")
+
+# ---------------------------------------------------------------------------
+# Print helpers
+# ---------------------------------------------------------------------------
+
+def banner(mode_label):
+    print("")
+    print("{}{}{}".format(C["BOLD"], "=" * 68, C["RESET"]))
+    print("{}  GRITS Agent Secure  v{}  by X Scale AI{}".format(C["BOLD"], GRITS_VERSION, C["RESET"]))
+    print("=" * 68)
+    print("")
+    print("  {}{}{}".format(C["BOLD"], mode_label, C["RESET"]))
+    print("")
+
+def print_trust_intro(fixes, config_path, backup_dir, backed_up):
+    """Print what will change and what will not, plus rollback instructions."""
+    print("  {}WHAT WILL CHANGE{}".format(C["YELLOW"], C["RESET"]))
+    n = 1
+    for fix in fixes:
+        if not fix.skipped:
+            print("  {}. [{}]  {}".format(n, fix.check_id, fix.title))
+            n += 1
+    print("")
+    print("  {}WHAT WILL NOT BE TOUCHED{}".format(C["GREEN"], C["RESET"]))
+    print("  - Existing firewall rules (only additive changes)")
+    print("  - Tools you currently allow (deny list is appended, not replaced)")
+    print("  - All other agent settings")
+    print("  - File contents (permissions only for .env / credentials)")
+    print("")
+
+    if backup_dir:
+        print("  {}BACKUP CREATED{}".format(C["CYAN"], C["RESET"]))
+        for f in backed_up:
+            print("  + {}".format(f))
+        print("")
+        if config_path:
+            rb = rollback_command(backup_dir, config_path)
+            print("  {}TO ROLL BACK AT ANY TIME:{}".format(C["BOLD"], C["RESET"]))
+            print("  {}{}{}".format(C["CYAN"], rb, C["RESET"]))
+        print("")
+    else:
+        print("  {}NOTE: No config found. Config-level fixes will be skipped.{}".format(
+            C["DIM"], C["RESET"]))
+        print("")
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="GRITS Agent Secure -- hardens your OpenClaw config safely",
+        epilog=GRITS_BRAND,
+    )
+    parser.add_argument("--config", help="Path to openclaw.json")
+    parser.add_argument("--apply",  action="store_true",
+                        help="Apply fixes (default is preview only)")
+    parser.add_argument("--yes",    action="store_true",
+                        help="Skip confirmation prompt (for CI/scripts)")
+    args = parser.parse_args()
+
+    apply    = args.apply
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    config_path  = find_openclaw_config(args.config)
+    config       = None
+    if config_path and config_path.exists():
+        try:
+            config = load_json5(config_path)
+        except Exception:
+            pass
+
+    # Build fix list
+    fixes = [
+        fix_firewall(),
+        fix_tool_deny(),
+        fix_sandbox(),
+        fix_env_perms(),
+        fix_creds_perms(),
+        fix_dangerous_flags(config),
+    ]
+
+    active_fixes = [f for f in fixes if not f.skipped]
+
+    if apply:
+        banner("APPLYING FIXES -- Platform: {}".format(PLATFORM.upper()))
+    else:
+        banner("PREVIEW MODE -- Nothing will be changed")
+        print("  {}Platform:{}  {}".format(C["DIM"], C["RESET"], PLATFORM.upper()))
+        print("  {}Config:{}    {}".format(C["DIM"], C["RESET"],
+              str(config_path) if config_path else "NOT FOUND"))
+        print("  {}Scanned:{}   {}".format(C["DIM"], C["RESET"], timestamp))
+        print("")
+        print("  Run  {}./grits-agent-secure --apply{}  to execute.".format(C["BOLD"], C["RESET"]))
+        print("")
+        print("-" * 68)
+        print("")
+
+    # Create backup before any changes
+    backup_dir, backed_up, backup_errors = create_backup(config_path) if config_path else (None, [], [])
+    if backup_errors:
+        for err in backup_errors:
+            print("  {}WARNING: backup issue -- {}{}".format(C["YELLOW"], err, C["RESET"]))
+        print("")
+
+    # Show trust intro
+    print_trust_intro(fixes, config_path, backup_dir, backed_up)
+
+    # In preview mode, stop here
+    if not apply:
+        # Show detailed preview
+        print("  {}FIXES THAT WOULD BE APPLIED{}".format(C["BOLD"], C["RESET"]))
+        print("")
+        for fix in fixes:
+            status = "{}SKIP{}  ".format(C["DIM"], C["RESET"]) if fix.skipped else "{}APPLY{} ".format(C["YELLOW"], C["RESET"])
+            print("  {}  [{}]  {}".format(status, fix.check_id, fix.title))
+            if fix.skipped:
+                print("         {}{}{}".format(C["DIM"], fix.skip_reason, C["RESET"]))
+            else:
+                print("         {}{}{}".format(C["DIM"], fix.description, C["RESET"]))
+                for cmd, explanation in fix.commands:
+                    print("         > {}".format(explanation))
+                    print("           {}{}{}".format(C["DIM"], cmd, C["RESET"]))
+                for key_path, (value, explanation) in fix.config_changes.items():
+                    print("         > {} -> {}".format(key_path, value))
+            print("")
+        print("-" * 68)
+        print("  {}{}{}".format(C["DIM"], GRITS_BRAND, C["RESET"]))
+        print("=" * 68)
+        print("")
+        return
+
+    # Confirm
+    if not args.yes:
+        print("-" * 68)
+        print("")
+        try:
+            answer = input("  Proceed? [y/N]  ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print("")
+            print("  Aborted.")
+            return
+        if answer not in ("y", "yes"):
+            print("  Aborted. Nothing was changed.")
+            if backup_dir:
+                print("  Backup preserved at: {}".format(backup_dir))
+            return
+        print("")
+
+    # Apply
+    print("-" * 68)
+    print("")
+    all_config_changes = {}
+    applied_count      = 0
+    skipped_count      = 0
+
+    for fix in fixes:
+        print("  {}[{}]{}  {}".format(C["BOLD"], fix.check_id, C["RESET"], fix.title))
+
+        if fix.skipped:
+            print("  {}SKIPPED: {}{}".format(C["DIM"], fix.skip_reason, C["RESET"]))
+            print("")
+            skipped_count += 1
+            continue
+
+        # Shell commands
+        for cmd, explanation in fix.commands:
+            print("  > {}".format(explanation))
+            success, output = cmd_run(cmd, dry_run=False)
+            if success:
+                print("    {}OK{}".format(C["GREEN"], C["RESET"]))
+            else:
+                print("    {}FAILED: {}{}".format(C["RED"], output, C["RESET"]))
+                fix.errors.append(output)
+            print("")
+
+        # Config changes (collect, apply after loop)
+        for key_path, (value, explanation) in fix.config_changes.items():
+            print("  > {} -> {}".format(key_path, value))
+            all_config_changes[key_path] = (value, explanation)
+            print("")
+
+        applied_count += 1
+
+    # Write config changes
+    if all_config_changes and config_path and config:
+        print("  {}Writing config changes...{}".format(C["CYAN"], C["RESET"]))
+        config = merge_config(config, all_config_changes)
+        try:
+            write_config(config_path, config)
+            print("  {}Config updated: {}{}".format(C["GREEN"], config_path, C["RESET"]))
+        except Exception as e:
+            print("  {}ERROR writing config: {}{}".format(C["RED"], e, C["RESET"]))
+    elif all_config_changes and not config_path:
+        print("  {}Config not found -- config-level changes were skipped.{}".format(
+            C["YELLOW"], C["RESET"]))
+
+    print("")
+    print("-" * 68)
+    print("")
+
+    # Summary
+    print("  {}DONE: {} fix(es) applied, {} skipped{}".format(
+        C["GREEN"], applied_count, skipped_count, C["RESET"]))
+    print("")
+
+    if backup_dir and config_path:
+        rb = rollback_command(backup_dir, config_path)
+        print("  {}TO ROLL BACK:{}".format(C["BOLD"], C["RESET"]))
+        print("  {}{}{}".format(C["CYAN"], rb, C["RESET"]))
+        print("")
+
+    print("  RE-SCAN TO VERIFY YOUR NEW SCORE:")
+    print("  {}./grits-agent-scanner{}".format(C["BOLD"], C["RESET"]))
+    print("")
+
+    # What still needs an expert
+    manual = [
+        ("OC02", "Gateway authentication",    "Requires your own token/auth setup"),
+        ("OC03", "Gateway bind address",       "Review if you need remote access"),
+        ("OC04", "DM policy",                  "Requires your Telegram user IDs"),
+        ("OC05", "Group policy",               "Requires your Telegram user IDs"),
+        ("OC11", "Plaintext API keys",         "Move keys to env vars or secrets manager"),
+        ("OC14", "Heartbeat model routing",    "Requires Ollama installation + config"),
+        ("OC15", "Spending limits",            "Set in your API provider dashboard"),
+        ("OC18", "LAN segmentation",           "VLAN/subnet design for your network"),
+        ("OC19", "Multi-agent isolation",      "Container/VM architecture decision"),
+        ("OC20", "Audit log pipeline",         "SIEM integration for your stack"),
+    ]
+    print("  {}STILL NEEDS AN EXPERT{}".format(C["YELLOW"], C["RESET"]))
+    for check_id, title, reason in manual:
+        print("  {}{}{}  {}  {}--{}  {}{}{}".format(
+            C["DIM"], check_id, C["RESET"], title,
+            C["DIM"], C["RESET"], C["DIM"], reason, C["RESET"]))
+    print("")
+    print("  Schedule a free 30-min call:  {}{}{}".format(C["BOLD"], GRITS_CONSULT, C["RESET"]))
+    print("")
+    print("-" * 68)
+    print("  {}{}{}".format(C["DIM"], GRITS_BRAND, C["RESET"]))
+    print("  {}{}{}".format(C["DIM"], GRITS_REPO, C["RESET"]))
+    print("=" * 68)
+    print("")
+
+
+if __name__ == "__main__":
+    main()

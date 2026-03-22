@@ -1,0 +1,27 @@
+{
+  "meta": {
+    "version": "1.0.0"
+  },
+  "auth": {
+    "profiles": {
+      "openrouter:default": {
+        "provider": "openrouter",
+        "mode": "api_key",
+        "apiKey": "${OPENROUTER_API_KEY}"
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "openrouter/auto",
+        "fallbacks": []
+      },
+      "maxConcurrent": 2
+    }
+  },
+  "commands": {
+    "native": "auto",
+    "nativeSkills": "auto"
+  }
+}

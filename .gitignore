@@ -1,0 +1,9 @@
+_private/
+.claude/
+CLAUDE.md
+
+*.grits-backup-*
+*.pyc
+__pycache__/
+.DS_Store
+*.log

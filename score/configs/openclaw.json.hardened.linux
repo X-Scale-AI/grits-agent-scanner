@@ -1,0 +1,86 @@
+{
+  "meta": {
+    "lastTouchedVersion": "2026.2.26"
+  },
+  "auth": {
+    "profiles": {
+      "openrouter:default": {
+        "provider": "openrouter",
+        "mode": "api_key",
+        "apiKey": "${OPENROUTER_API_KEY}"
+      }
+    }
+  },
+  "models": {
+    "providers": {
+      "freerouter": {
+        "baseUrl": "http://127.0.0.1:18801/v1",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "freerouter/auto",
+            "name": "FreeRouter Auto",
+            "input": ["text"]
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "openrouter/auto",
+        "fallbacks": [
+          "openrouter/anthropic/claude-3.5-sonnet",
+          "openrouter/anthropic/claude-3.5-haiku"
+        ]
+      },
+      "contextTokens": 50000,
+      "compaction": {
+        "mode": "safeguard"
+      },
+      "thinkingDefault": "low",
+      "maxConcurrent": 4
+    }
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "dmPolicy": "allowlist",
+      "botToken": "${TELEGRAM_BOT_TOKEN}",
+      "allowFrom": ["8321610210"]
+    }
+  },
+  "gateway": {
+    "port": 18789,
+    "mode": "local",
+    "auth": {
+      "mode": "token",
+      "token": "${OPENCLAW_GATEWAY_TOKEN}"
+    }
+  },
+  "plugins": {
+    "allow": ["openclaw-freerouter", "telegram", "openclaw-tavily"],
+    "entries": {
+      "openclaw-freerouter": {
+        "enabled": true,
+        "config": {
+          "port": 18801,
+          "tiers": {
+            "SIMPLE": { "primary": "openrouter/deepseek/deepseek-chat", "fallback": [] },
+            "MEDIUM": { "primary": "openrouter/google/gemini-2.0-flash", "fallback": ["openrouter/deepseek/deepseek-chat"] },
+            "COMPLEX": { "primary": "openrouter/anthropic/claude-3.5-sonnet", "fallback": [] },
+            "REASONING": { "primary": "openrouter/openai/o3-mini", "fallback": [] }
+          },
+          "defaultTier": "MEDIUM"
+        }
+      },
+      "openclaw-tavily": {
+        "enabled": true,
+        "config": {
+          "apiKey": "${TAVILY_API_KEY}"
+        }
+      }
+    }
+  }
+}

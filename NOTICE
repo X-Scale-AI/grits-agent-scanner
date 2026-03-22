@@ -1,0 +1,63 @@
+GRITS - Governance, Risk, Integrity, Trust, Security
+Copyright 2024-2026 X Scale AI (https://xscaleai.com)
+
+This product includes software developed by X Scale AI.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+================================================================================
+ATTRIBUTION REQUIREMENTS
+================================================================================
+
+Per Apache License 2.0 Section 4(b), this NOTICE file must be included in all
+copies or substantial portions of the Software, including derivative works.
+
+SCANNER OUTPUT ATTRIBUTION
+--------------------------
+Any tool, service, dashboard, or report that executes a GRITS scanner or
+displays GRITS scoring results must retain the following attribution in
+the output:
+
+    Scored with GRITS by X Scale AI
+
+This attribution appears in all scanner output formats (terminal, markdown,
+JSON) and must not be removed, obscured, or modified in derivative works
+that produce GRITS-scored output.
+
+DERIVATIVE WORKS
+----------------
+Forks, adaptations, and derivative works must:
+
+1. Include this NOTICE file in its entirety.
+2. Credit X Scale AI as the original author of the GRITS framework.
+3. Clearly indicate any modifications made to the original framework.
+4. Retain the "Scored with GRITS by X Scale AI" attribution line in any
+   scanner or scoring tool output derived from this codebase.
+
+FRAMEWORK REFERENCES
+--------------------
+The GRITS 5-Layer Zero-Trust Model, control catalog, and scoring methodology
+are original works of X Scale AI. References to the GRITS framework in
+documentation, publications, or presentations should cite:
+
+    GRITS Framework by X Scale AI
+    https://github.com/X-Scale-AI/GRITS
+    https://xscaleai.com
+
+TRADEMARK NOTICE
+----------------
+"GRITS" and "X Scale AI" are trademarks of X Scale AI. Use of these marks
+in derivative works must not imply endorsement by X Scale AI unless
+explicitly authorized.
+
+================================================================================
+CONTACT
+================================================================================
+
+X Scale AI
+https://xscaleai.com
+https://github.com/X-Scale-AI
