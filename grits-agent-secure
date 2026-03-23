@@ -355,7 +355,7 @@ def _firewall_already_active():
             return True
         return False
     elif PLATFORM == "linux":
-        status = cmd_run_output("ufw status 2>/dev/null")
+        status = cmd_run_output("sudo ufw status 2>/dev/null || ufw status 2>/dev/null")
         if status and "Status: active" in status:
             return True
         ipt = cmd_run_output("iptables -L OUTPUT -n 2>/dev/null | head -5")
@@ -410,9 +410,13 @@ def fix_firewall():
 # OC07: Add dangerous tools to deny list
 # ---------------------------------------------------------------------------
 
-def fix_tool_deny():
+def fix_tool_deny(config):
     fix = FixAction("OC07", "Add dangerous tools to deny list",
                     "Appends to your existing deny list. Does not remove any tools you currently allow.")
+    if config is None:
+        fix.skipped     = True
+        fix.skip_reason = "No config file found. Create ~/.openclaw/openclaw.json first."
+        return fix
     dangerous = ["file_write", "code_execution", "shell_exec", "browser_navigate"]
     fix.add_cfg("tools.deny", dangerous,
                 "Append to deny list: {}".format(", ".join(dangerous)))
@@ -422,9 +426,13 @@ def fix_tool_deny():
 # OC09: Enable sandbox mode
 # ---------------------------------------------------------------------------
 
-def fix_sandbox():
+def fix_sandbox(config):
     fix = FixAction("OC09", "Enable sandbox mode",
                     "Sets agent.sandbox = true. Does not change any other agent settings.")
+    if config is None:
+        fix.skipped     = True
+        fix.skip_reason = "No config file found. Create ~/.openclaw/openclaw.json first."
+        return fix
     fix.add_cfg("agent.sandbox", True, "Set agent.sandbox to true")
     return fix
 
@@ -562,6 +570,11 @@ def _print_expert_items(config_arg=None):
     except Exception:
         expert = []
 
+    # Filter out findings that couldn't be evaluated (no config)
+    _config_noise = ("config not loaded", "no config file", "config not found")
+    expert = [f for f in expert
+              if not any(s in (f.get("detail") or "").lower() for s in _config_noise)]
+
     if not expert:
         return
 
@@ -673,8 +686,8 @@ def main():
     # Build fix list
     fixes = [
         fix_firewall(),
-        fix_tool_deny(),
-        fix_sandbox(),
+        fix_tool_deny(config),
+        fix_sandbox(config),
         fix_env_perms(),
         fix_creds_perms(),
         fix_dangerous_flags(config),
