@@ -1,4 +1,4 @@
-# GRITS: AI Agent Security Scanner & Auto-Fixer
+# GRITS Audit: AI Agent Security Scanner & Auto-Fixer
 
 <p align="center">
   <img src=".github/assets/grits-banner.svg" alt="GRITS Agent Scanner" width="100%">
@@ -9,7 +9,7 @@
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Ubuntu%20%7C%20CentOS%2FRHEL-lightgrey.svg)]()
 [![By X Scale AI](https://img.shields.io/badge/by-X%20Scale%20AI-black.svg)](https://xscaleai.com)
 
-Your AI agent has unrestricted access to your filesystem, your API keys, and every device on your network. Most ship that way by default.
+70% of AI agent deployments ship with unrestricted access to your API keys, filesystem, and local network. Most operators never find out until something goes wrong.
 
 **GRITS** scans your agent's live configuration, scores your security posture across 5 layers, and patches what it can automatically -- with a full backup and one-command rollback before touching anything.
 
