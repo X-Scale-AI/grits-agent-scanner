@@ -30,37 +30,47 @@ No dependencies. Python 3 stdlib only.
 
 ---
 
-## What GRITS Finds
+## The 5-Layer Zero-Trust Architecture
 
-Most AI agent configs ship with the same class of vulnerabilities. GRITS surfaces them across five layers:
+Native tools like `openclaw security audit` act as smoke detectors -- they tell you there is a fire, but leave the high-risk manual patching to you. **GRITS is the fire extinguisher.** GRITS actively scans, scores, and remediates vulnerabilities across the five critical trust boundaries:
 
-- **Credential leakage** -- API keys sitting in plaintext, credential files readable by any process on the host
-- **Unauthorized filesystem access** -- agents running without sandboxing, able to read your SSH keys, `.env` files, and home directory
-- **Unrestricted LAN exposure** -- a compromised agent that can reach every device on your network
-- **Missing trust boundaries** -- no identity verification on who can command your agent, no isolation between agents sharing a host
-- **Cloud cost bleed** -- unthrottled API usage, expensive model routing for tasks that could run locally, no spending caps
+- **Layer 1: Network (Blast Radius):** Unrestricted LAN exposure. We detect and help restrict agents from port-scanning or attacking your private `192.168.x.x` home or VPC subnets.
+- **Layer 2: Operator (Identity):** Missing trust boundaries. We enforce cryptographic Telegram ID allowlists so unauthorized users can't hijack your agent.
+- **Layer 3: Application (Plugin Sandbox):** Unauthorized tool access. We lock down permissive tool policies to strict, explicit allowlists.
+- **Layer 4: OS & Secrets (Credential Vault):** Credential leakage. We flag plaintext API keys sitting in `openclaw.json` and enforce system-level secret injection.
+- **Layer 5: Financial (Cloud Cost Bleed):** Unthrottled API usage. We patch bloated contexts and re-route expensive background heartbeats to free, local SLMs.
 
-Run `./grits-audit` to see exactly what you're exposing and what can be fixed right now.
+Run `./grits-audit` to see exactly what you're exposing and what can be patched automatically right now.
 
 ---
 
-## How It Works
+## How It Works (Stateful & Safe)
 
-`./grits-audit` runs a three-step workflow:
+Patching a live AI agent is risky. One malformed JSON bracket can crash the gateway. `./grits-audit` eliminates that risk using a stateful three-step workflow:
 
-1. **Scans** your live config and scores your posture
-2. **Applies** auto-fixes with your confirmation -- backs up first, rolls back with one command
-3. **Re-scans** and shows your before/after score improvement
-
-For CI/CD pipelines, advanced output formats, and rollback options, run:
-
-```bash
-./grits-audit --help
-./grits-agent-scanner --help
-./grits-agent-secure --help
-```
+1. **Scans:** Evaluates your live config and scores your zero-trust posture.
+2. **Safely Patches:** Takes a complete snapshot of your state *before* mutating anything. Applies the auto-fixes with your confirmation. (If anything breaks, `grits-audit --rollback` restores your exact previous state instantly).
+3. **Re-scans:** Verifies the applied patches and generates your updated compliance score.
 
 Currently supports **OpenClaw** and **NVIDIA NemoClaw**.
+
+---
+
+## Continuous Compliance (CI/CD Integration)
+
+A secure baseline is useless if a developer accidentally opens a port, tweaks a plugin policy, or commits a plaintext API key next week. **Configuration drift is the #1 cause of compromised AI agents.**
+
+GRITS isn't just a local developer tool; it is an automated gatekeeper designed to run headlessly in your CI/CD pipelines (GitHub Actions, GitLab CI, etc.).
+
+- **Block Insecure Deployments:** Instantly fail the build and block pull requests if an agent's Zero-Trust boundaries are degraded.
+- **Zero-Touch Auditing:** Generate machine-readable compliance reports (JSON, SARIF) on every single commit.
+- **Enforce the Standard:** Guarantee that no agent hits production unless it strictly adheres to your 5-Layer Security Model.
+
+To configure GRITS for headless pipeline execution and advanced reporting, run:
+
+```bash
+./grits-audit --ci-mode --help
+```
 
 ---
 

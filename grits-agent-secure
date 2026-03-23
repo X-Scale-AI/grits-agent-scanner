@@ -37,6 +37,7 @@ https://github.com/X-Scale-AI/grits-agent-scanner
 
 import argparse
 import datetime
+import ipaddress
 import json
 import os
 import platform
@@ -141,6 +142,393 @@ def file_owner(path):
         return os.stat(path).st_uid
     except Exception:
         return None
+
+# ---------------------------------------------------------------------------
+# SSH lockout prevention helpers
+# ---------------------------------------------------------------------------
+
+def _get_ssh_ports():
+    """Parse sshd_config for Port directives. Returns list of int port numbers."""
+    ports = []
+    for cfg in ("/etc/ssh/sshd_config", "/etc/sshd_config"):
+        p = Path(cfg)
+        if p.exists():
+            try:
+                for line in p.read_text().splitlines():
+                    if re.match(r'^\s*Port\s+\d+', line, re.IGNORECASE):
+                        try:
+                            ports.append(int(line.split()[1]))
+                        except (ValueError, IndexError):
+                            pass
+            except Exception:
+                pass
+    return ports if ports else [22]
+
+
+def _current_ssh_client_ip():
+    """Return SSH client IP from SSH_CONNECTION or SSH_CLIENT env var, or None."""
+    for var in ("SSH_CONNECTION", "SSH_CLIENT"):
+        val = os.environ.get(var, "").strip()
+        if val:
+            return val.split()[0]
+    return None
+
+
+def _is_over_ssh():
+    return bool(os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_CLIENT"))
+
+
+def _detect_local_subnet():
+    """Return the primary local subnet as a CIDR string, or None."""
+    # Linux: ip route
+    out = cmd_run_output("ip route show scope link 2>/dev/null")
+    if out:
+        for line in out.splitlines():
+            parts = line.split()
+            if parts and "/" in parts[0]:
+                try:
+                    net = ipaddress.ip_network(parts[0], strict=False)
+                    if net.is_private:
+                        return str(net)
+                except ValueError:
+                    pass
+        # No private found -- return first valid (VPS with public subnet)
+        for line in out.splitlines():
+            parts = line.split()
+            if parts and "/" in parts[0]:
+                try:
+                    return str(ipaddress.ip_network(parts[0], strict=False))
+                except ValueError:
+                    pass
+    # macOS: parse ifconfig
+    out = cmd_run_output("ifconfig 2>/dev/null")
+    if out:
+        ip, mask = None, None
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("inet ") and "127.0.0.1" not in line:
+                parts = line.split()
+                try:
+                    ip = parts[1]
+                    # netmask is either dotted-quad or hex (0xffffff00)
+                    mi = parts.index("netmask") + 1
+                    raw = parts[mi]
+                    if raw.startswith("0x"):
+                        mask = str(ipaddress.IPv4Address(int(raw, 16)))
+                    else:
+                        mask = raw
+                    net = ipaddress.ip_network("{}/{}".format(ip, mask), strict=False)
+                    if net.is_private:
+                        return str(net)
+                except Exception:
+                    pass
+    return None
+
+
+def _is_public_subnet(cidr):
+    try:
+        return not ipaddress.ip_network(cidr, strict=False).is_private
+    except ValueError:
+        return False
+
+
+def _validate_ip_or_cidr(value):
+    """Return normalized CIDR string or None if invalid."""
+    value = value.strip()
+    try:
+        return str(ipaddress.ip_network(value, strict=False))
+    except ValueError:
+        pass
+    try:
+        addr = ipaddress.ip_address(value)
+        return "{}/32".format(addr) if addr.version == 4 else "{}/128".format(addr)
+    except ValueError:
+        pass
+    return None
+
+
+def _to_host_cidr(ip_str):
+    try:
+        addr = ipaddress.ip_address(ip_str)
+        return "{}/32".format(addr) if addr.version == 4 else "{}/128".format(addr)
+    except ValueError:
+        return "{}/32".format(ip_str)
+
+
+def _to_subnet(ip_str, prefix=None):
+    try:
+        addr = ipaddress.ip_address(ip_str)
+        default_prefix = 64 if addr.version == 6 else 24
+        p = prefix if prefix is not None else default_prefix
+        return str(ipaddress.ip_network("{}/{}".format(addr, p), strict=False))
+    except ValueError:
+        return None
+
+
+def _sshd_is_running():
+    """Return True if sshd is running, False if confirmed down, None if unknown."""
+    for svc in ("sshd", "ssh"):
+        out = cmd_run_output("systemctl is-active {} 2>/dev/null".format(svc))
+        if out == "active":
+            return True
+        if out in ("inactive", "failed", "dead"):
+            return False
+    # Fallback: ss / netstat
+    out = cmd_run_output("ss -tlnp 2>/dev/null") or cmd_run_output("netstat -tlnp 2>/dev/null")
+    if out:
+        if ":22 " in out or "sshd" in out:
+            return True
+    # macOS launchd
+    if cmd_run_output("launchctl list com.openssh.sshd 2>/dev/null"):
+        return True
+    return None
+
+
+def _ufw_has_ssh_rule(port):
+    """Return True if UFW already has an allow rule for the given port."""
+    out = cmd_run_output("sudo ufw status 2>/dev/null")
+    if out:
+        for line in out.splitlines():
+            if str(port) in line and "ALLOW" in line.upper():
+                return True
+    return False
+
+
+def prompt_ssh_allowlist(skip_confirm=False):
+    """
+    Interactively determine how SSH should be allowed before enabling default-deny.
+
+    Returns:
+      list of (cidr, port) tuples  -- rules to add (may be empty if user skips)
+      None                         -- user cancelled; abort OC01 entirely
+    """
+    ssh_ports = _get_ssh_ports()
+    over_ssh  = _is_over_ssh()
+    client_ip = _current_ssh_client_ip()
+    local_sub = _detect_local_subnet()
+    sshd_up   = _sshd_is_running()
+
+    print("")
+    print("  {}SSH LOCKOUT PREVENTION{}".format(C["CYAN"], C["RESET"]))
+    print("  " + "-" * 60)
+
+    # sshd confirmed not running -- no SSH rule needed
+    if sshd_up is False:
+        print("  sshd is not running on this machine. No SSH rule needed.")
+        print("")
+        return []
+
+    port_str = ", ".join(str(p) for p in ssh_ports)
+    if ssh_ports != [22]:
+        print("  SSH running on non-standard port(s): {}{}{}".format(
+            C["BOLD"], port_str, C["RESET"]))
+    else:
+        print("  SSH port: 22")
+
+    # Already has an SSH rule in UFW -- still inform and let user decide
+    if cmd_exists("ufw"):
+        for p in ssh_ports:
+            if _ufw_has_ssh_rule(p):
+                print("  {}NOTE: UFW already has an allow rule for port {}.{}".format(
+                    C["DIM"], p, C["RESET"]))
+                print("  Skipping SSH allowlist -- existing rule will persist.")
+                print("")
+                return []
+
+    print("")
+    if over_ssh:
+        print("  {}WARNING: This session is running over SSH.{}".format(C["YELLOW"], C["RESET"]))
+        print("  Enabling default-deny without an SSH allow rule")
+        print("  will lock you out of this machine immediately.")
+        if client_ip:
+            print("")
+            print("  Your SSH client IP: {}{}{}".format(C["BOLD"], client_ip, C["RESET"]))
+    else:
+        print("  You appear to be on the local console (not SSH).")
+        print("  An SSH allow rule is still recommended for future remote access.")
+
+    print("")
+
+    # --- Non-interactive mode (--yes / CI) ---
+    if skip_confirm:
+        if over_ssh and client_ip:
+            cidr = _to_host_cidr(client_ip)
+            print("  {}--yes mode: auto-allowing SSH from current client IP: {}{}".format(
+                C["DIM"], cidr, C["RESET"]))
+            print("")
+            return [(cidr, p) for p in ssh_ports]
+        else:
+            print("  {}--yes mode: console session assumed. No SSH rule added.{}".format(
+                C["DIM"], C["RESET"]))
+            print("")
+            return []
+
+    # --- Build interactive menu ---
+    options = []   # list of (key, display, cidrs_or_None, tag)
+    #   cidrs_or_None:  list[str] = specific CIDRs to allow
+    #                   None      = sentinel for manual entry or cancel
+
+    if over_ssh and client_ip:
+        options.append(("1",
+            "Allow SSH only from my current IP: {}{}{}".format(
+                C["BOLD"], client_ip, C["RESET"]),
+            [_to_host_cidr(client_ip)],
+            "RECOMMENDED"))
+
+        client_sub = _to_subnet(client_ip, 24)
+        if client_sub:
+            pub_note = "  {}[CAUTION: public subnet]{}".format(
+                C["YELLOW"], C["RESET"]) if _is_public_subnet(client_sub) else ""
+            options.append(("2",
+                "Allow SSH from my current /24 subnet: {}{}{}{}".format(
+                    C["BOLD"], client_sub, C["RESET"], pub_note),
+                [client_sub],
+                ""))
+
+    if local_sub:
+        pub_note = "  {}[CAUTION: public subnet]{}".format(
+            C["YELLOW"], C["RESET"]) if _is_public_subnet(local_sub) else ""
+        options.append((str(len(options) + 1),
+            "Allow SSH from this machine's local subnet: {}{}{}{}".format(
+                C["BOLD"], local_sub, C["RESET"], pub_note),
+            [local_sub],
+            ""))
+
+    MANUAL_KEY    = str(len(options) + 1)
+    options.append((MANUAL_KEY,
+        "Enter a specific IP or CIDR manually",
+        None,
+        ""))
+
+    EVERYWHERE_KEY = str(len(options) + 1)
+    options.append((EVERYWHERE_KEY,
+        "Allow SSH from everywhere (0.0.0.0/0)",
+        ["0.0.0.0/0"],
+        "{}INSECURE -- last resort{}".format(C["RED"], C["RESET"])))
+
+    SKIP_KEY = str(len(options) + 1)
+    if over_ssh:
+        options.append((SKIP_KEY,
+            "Skip SSH rule -- I have console/out-of-band access",
+            [],
+            "{}DANGEROUS if wrong{}".format(C["RED"], C["RESET"])))
+    else:
+        options.append((SKIP_KEY,
+            "Skip SSH rule -- I don't need remote SSH access",
+            [],
+            ""))
+
+    CANCEL_KEY = str(len(options) + 1)
+    options.append((CANCEL_KEY,
+        "Cancel -- do not enable firewall yet",
+        None,
+        ""))
+
+    for key, label, _, tag in options:
+        tag_str = "  [{}]".format(tag) if tag else ""
+        print("  {})  {}{}".format(key, label, tag_str))
+
+    print("")
+
+    chosen_cidrs = "PENDING"
+    attempts = 0
+    while chosen_cidrs == "PENDING" and attempts < 5:
+        attempts += 1
+        try:
+            choice = input("  Your choice [1-{}]: ".format(len(options))).strip()
+        except (EOFError, KeyboardInterrupt):
+            print("")
+            print("  {}Interrupted. Cancelling OC01.{}".format(C["YELLOW"], C["RESET"]))
+            return None
+
+        matched = next(((k, l, c, t) for k, l, c, t in options if choice == k), None)
+        if not matched:
+            print("  Invalid choice. Enter a number between 1 and {}.".format(len(options)))
+            continue
+
+        key, _, cidrs, _ = matched
+
+        if key == CANCEL_KEY:
+            return None
+
+        elif key == EVERYWHERE_KEY:
+            print("")
+            print("  {}WARNING: 0.0.0.0/0 exposes port {} to the entire internet.{}".format(
+                C["RED"], port_str, C["RESET"]))
+            print("  Your machine will receive brute-force attacks.")
+            try:
+                confirm = input("  Type YES to confirm: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("")
+                continue
+            if confirm == "YES":
+                chosen_cidrs = cidrs
+            else:
+                print("  Cancelled. Choose another option.")
+
+        elif key == SKIP_KEY and over_ssh:
+            print("")
+            print("  {}DANGER: You ARE connected over SSH right now.{}".format(
+                C["RED"], C["RESET"]))
+            print("  Skipping the SSH rule WILL lock you out when the firewall enables.")
+            print("  Only proceed if you have verified console/out-of-band access.")
+            try:
+                confirm = input("  Type exactly: I UNDERSTAND I MAY LOSE ACCESS  ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("")
+                continue
+            if confirm == "I UNDERSTAND I MAY LOSE ACCESS":
+                chosen_cidrs = []
+            else:
+                print("  Cancelled. Choose another option.")
+
+        elif key == MANUAL_KEY:
+            print("")
+            print("  Enter one or more IPs or CIDRs, comma-separated.")
+            print("  Examples:  203.0.113.42   or   10.0.1.0/24,192.168.5.10")
+            manual_attempts = 0
+            while manual_attempts < 3:
+                manual_attempts += 1
+                try:
+                    raw = input("  IP/CIDR: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print("")
+                    break
+                entries   = [e.strip() for e in raw.split(",") if e.strip()]
+                validated = [_validate_ip_or_cidr(e) for e in entries]
+                invalid   = [entries[i] for i, v in enumerate(validated) if v is None]
+                validated = [v for v in validated if v is not None]
+                if invalid:
+                    print("  {}Invalid: {}. Try again.{}".format(
+                        C["RED"], ", ".join(invalid), C["RESET"]))
+                    continue
+                if not validated:
+                    print("  No valid entries. Try again.")
+                    continue
+                for cidr in validated:
+                    try:
+                        net = ipaddress.ip_network(cidr, strict=False)
+                        if not net.is_private and net.prefixlen < 24:
+                            print("  {}NOTE: {} is a broad public range. Consider narrowing it.{}".format(
+                                C["YELLOW"], cidr, C["RESET"]))
+                    except ValueError:
+                        pass
+                chosen_cidrs = validated
+                break
+            if chosen_cidrs == "PENDING":
+                print("  Too many invalid attempts. Choose another option.")
+
+        else:
+            chosen_cidrs = cidrs
+
+    if chosen_cidrs == "PENDING":
+        print("  {}Too many attempts. Cancelling OC01.{}".format(C["YELLOW"], C["RESET"]))
+        return None
+
+    print("")
+    # Return (cidr, port) pairs -- empty list = user chose skip
+    return [(cidr, p) for cidr in chosen_cidrs for p in ssh_ports] if chosen_cidrs else []
+
 
 # ---------------------------------------------------------------------------
 # JSON5 loader
@@ -389,7 +777,7 @@ def _firewall_already_active():
     return False
 
 
-def fix_firewall():
+def fix_firewall(apply=False, skip_confirm=False):
     fix = FixAction("OC01", "Enable host firewall",
                     "Turns on the firewall. Adds default-deny policy and allows HTTPS/DNS outbound.")
 
@@ -399,15 +787,19 @@ def fix_firewall():
         return fix
 
     if PLATFORM == "linux":
-        if cmd_exists("ufw"):
-            # Ubuntu / Debian
-            fix.add_cmd("sudo ufw default deny outgoing",  "Default outbound: deny")
-            fix.add_cmd("sudo ufw default deny incoming",  "Default inbound: deny")
-            fix.add_cmd("sudo ufw allow out 443/tcp",      "Allow HTTPS outbound")
-            fix.add_cmd("sudo ufw allow out 53/udp",       "Allow DNS")
-            fix.add_cmd("sudo ufw --force enable",         "Enable UFW")
-        elif cmd_exists("firewall-cmd"):
-            # CentOS / RHEL / Fedora / Rocky / AlmaLinux
+        uses_ufw       = cmd_exists("ufw")
+        uses_firewalld = cmd_exists("firewall-cmd")
+
+        if uses_ufw:
+            fix.add_cmd("sudo ufw default deny outgoing", "Default outbound: deny")
+            fix.add_cmd("sudo ufw default deny incoming", "Default inbound: deny")
+            fix.add_cmd("sudo ufw allow out 443/tcp",     "Allow HTTPS outbound")
+            fix.add_cmd("sudo ufw allow out 53/udp",      "Allow DNS")
+            _inject_ssh_rules_ufw(fix, apply, skip_confirm)
+            if not fix.skipped:
+                fix.add_cmd("sudo ufw --force enable", "Enable UFW")
+
+        elif uses_firewalld:
             fix.add_cmd("sudo systemctl enable --now firewalld",
                         "Enable and start firewalld")
             fix.add_cmd("sudo firewall-cmd --set-default-zone=drop",
@@ -416,10 +808,12 @@ def fix_firewall():
                         "Allow HTTPS outbound")
             fix.add_cmd("sudo firewall-cmd --permanent --add-port=53/udp",
                         "Allow DNS outbound")
-            fix.add_cmd("sudo firewall-cmd --reload",
-                        "Apply permanent rules")
+            _inject_ssh_rules_firewalld(fix, apply, skip_confirm)
+            if not fix.skipped:
+                fix.add_cmd("sudo firewall-cmd --reload", "Apply permanent rules")
+
         elif DISTRO == "rhel":
-            fix.add_cmd("sudo dnf install -y firewalld",   "Install firewalld")
+            fix.add_cmd("sudo dnf install -y firewalld", "Install firewalld")
             fix.add_cmd("sudo systemctl enable --now firewalld",
                         "Enable and start firewalld")
             fix.add_cmd("sudo firewall-cmd --set-default-zone=drop",
@@ -428,17 +822,24 @@ def fix_firewall():
                         "Allow HTTPS outbound")
             fix.add_cmd("sudo firewall-cmd --permanent --add-port=53/udp",
                         "Allow DNS outbound")
-            fix.add_cmd("sudo firewall-cmd --reload",
-                        "Apply permanent rules")
+            _inject_ssh_rules_firewalld(fix, apply, skip_confirm)
+            if not fix.skipped:
+                fix.add_cmd("sudo firewall-cmd --reload", "Apply permanent rules")
+
         else:
-            fix.add_cmd("sudo apt-get install -y ufw",         "Install UFW")
-            fix.add_cmd("sudo ufw default deny outgoing",      "Default outbound: deny")
-            fix.add_cmd("sudo ufw default deny incoming",      "Default inbound: deny")
-            fix.add_cmd("sudo ufw allow out 443/tcp",          "Allow HTTPS outbound")
-            fix.add_cmd("sudo ufw allow out 53/udp",           "Allow DNS")
-            fix.add_cmd("sudo ufw --force enable",             "Enable UFW")
+            # Debian/Ubuntu without ufw pre-installed
+            fix.add_cmd("sudo apt-get install -y ufw",    "Install UFW")
+            fix.add_cmd("sudo ufw default deny outgoing", "Default outbound: deny")
+            fix.add_cmd("sudo ufw default deny incoming", "Default inbound: deny")
+            fix.add_cmd("sudo ufw allow out 443/tcp",     "Allow HTTPS outbound")
+            fix.add_cmd("sudo ufw allow out 53/udp",      "Allow DNS")
+            _inject_ssh_rules_ufw(fix, apply, skip_confirm)
+            if not fix.skipped:
+                fix.add_cmd("sudo ufw --force enable", "Enable UFW")
 
     elif PLATFORM == "macos":
+        # macOS Application Firewall is inbound-app-based, not packet filter.
+        # pf controls incoming connections per-app; SSH is not affected by enabling ALF.
         fix.add_cmd(
             "sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate on",
             "Enable macOS Application Firewall")
@@ -451,6 +852,71 @@ def fix_firewall():
         fix.skip_reason = "Unsupported platform for auto-fix."
 
     return fix
+
+
+def _inject_ssh_rules_ufw(fix, apply, skip_confirm):
+    """
+    Prompt for SSH allowlist and inject ufw allow rules into fix before enable.
+    Marks fix as skipped (cancelled) if user aborts.
+    In preview mode, adds a descriptive placeholder so the user knows a prompt is coming.
+    """
+    if not apply:
+        # Preview: show that a prompt will happen at apply time
+        fix.add_cmd(
+            "# [interactive prompt at apply time]",
+            "Allow SSH inbound -- you will be asked for source IP/CIDR before this runs")
+        return
+
+    ssh_rules = prompt_ssh_allowlist(skip_confirm=skip_confirm)
+
+    if ssh_rules is None:
+        fix.skipped     = True
+        fix.skip_reason = "SSH allowlist cancelled. Firewall not enabled to prevent lockout."
+        return
+
+    for cidr, port in ssh_rules:
+        if cidr == "0.0.0.0/0":
+            fix.add_cmd(
+                "sudo ufw allow in to any port {} proto tcp".format(port),
+                "Allow SSH from everywhere on port {}".format(port))
+        else:
+            fix.add_cmd(
+                "sudo ufw allow in from {} to any port {} proto tcp".format(cidr, port),
+                "Allow SSH from {} on port {}".format(cidr, port))
+
+
+def _inject_ssh_rules_firewalld(fix, apply, skip_confirm):
+    """
+    Same as _inject_ssh_rules_ufw but generates firewall-cmd rich rules.
+    """
+    if not apply:
+        fix.add_cmd(
+            "# [interactive prompt at apply time]",
+            "Allow SSH inbound -- you will be asked for source IP/CIDR before this runs")
+        return
+
+    ssh_rules = prompt_ssh_allowlist(skip_confirm=skip_confirm)
+
+    if ssh_rules is None:
+        fix.skipped     = True
+        fix.skip_reason = "SSH allowlist cancelled. Firewall not enabled to prevent lockout."
+        return
+
+    if not ssh_rules:
+        # User chose to skip SSH rule -- nothing to inject
+        return
+
+    for cidr, port in ssh_rules:
+        if cidr == "0.0.0.0/0":
+            fix.add_cmd(
+                "sudo firewall-cmd --permanent --add-port={}/tcp".format(port),
+                "Allow SSH from everywhere on port {}".format(port))
+        else:
+            fix.add_cmd(
+                "sudo firewall-cmd --permanent --add-rich-rule="
+                "'rule family=\"ipv4\" source address=\"{}\" "
+                "port port=\"{}\" protocol=\"tcp\" accept'".format(cidr, port),
+                "Allow SSH from {} on port {}".format(cidr, port))
 
 # ---------------------------------------------------------------------------
 # OC07: Add dangerous tools to deny list
@@ -735,9 +1201,9 @@ def main():
         except Exception:
             pass
 
-    # Build fix list
+    # Build fix list with placeholder for OC01 (no SSH prompt yet -- fires after confirm)
     fixes = [
-        fix_firewall(),
+        fix_firewall(apply=False, skip_confirm=args.yes),
         fix_tool_deny(config),
         fix_sandbox(config),
         fix_env_perms(),
@@ -811,6 +1277,9 @@ def main():
                 print("  Backup preserved at: {}".format(backup_dir))
             return
         print("")
+
+    # Re-build OC01 now with the real SSH prompt -- user has context and has confirmed
+    fixes[0] = fix_firewall(apply=apply, skip_confirm=args.yes)
 
     # Apply
     print("-" * 68)
