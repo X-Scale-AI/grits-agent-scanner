@@ -1159,78 +1159,92 @@ def score_bar(score):
 
 def format_terminal(findings, score, rating, source_label, agent_label, timestamp):
     lines_check = OC_LINES if agent_label == "OpenClaw" else NC_LINES
+    I   = "  "                                                         # indent
+    HR  = "{}{}{}{}".format(I, C["DIM"], "\u2500" * 54, C["RESET"]) # thin rule
     lines = []
+
+    # ── Header: brand once ───────────────────────────────────────────
     lines.append("")
-    lines.append("{}{}{}".format(C["BOLD"], "=" * 68, C["RESET"]))
-    lines.append("{}  GRITS Agent Scanner  v{}  by X Scale AI{}".format(C["BOLD"], GRITS_VERSION, C["RESET"]))
-    lines.append("=" * 68)
-    lines.append("")
-    lines.append("  {}WHAT THIS TOOL DOES{}".format(C["DIM"], C["RESET"]))
-    lines.append("  {}Reads your config. Checks security. Reports findings.{}".format(C["DIM"], C["RESET"]))
-    lines.append("  {}Nothing is modified. Ever.{}".format(C["DIM"], C["RESET"]))
-    lines.append("")
-    lines.append("  Platform  {}".format(PLATFORM.upper()))
-    lines.append("  Agent     {}".format(agent_label))
-    lines.append("  Config    {}".format(source_label))
-    lines.append("  Scanned   {}".format(timestamp))
-    lines.append("")
-    lines.append("-" * 68)
+    lines.append("{}{}GRITS{}  v{}  \u00b7  X Scale AI".format(I, C["BOLD"], C["RESET"], GRITS_VERSION))
+    lines.append("{}{}Agent    {}{}".format(I, C["DIM"], C["RESET"], agent_label))
+    lines.append("{}{}Config   {}{}".format(I, C["DIM"], C["RESET"], source_label))
+    lines.append("{}{}Scanned  {}{}".format(I, C["DIM"], C["RESET"], timestamp))
     lines.append("")
 
-    layers = {}
+    # ── Findings grouped by layer ────────────────────────────────────
+    layers     = {}
+    layer_meta = {}
     for f in findings:
-        key = "L{} -- {}".format(f.layer, f.layer_name.upper())
-        layers.setdefault(key, []).append(f)
+        layers.setdefault(f.layer, []).append(f)
+        layer_meta[f.layer] = f.layer_name
 
-    for layer_key in sorted(layers.keys()):
-        lines.append("  {}{}{}".format(C["BOLD"] + C["CYAN"], layer_key, C["RESET"]))
-        for f in layers[layer_key]:
-            entry = lines_check.get(f.check_id)
-            if f.passed:
-                msg  = entry[1] if entry else f.title
-                icon = "{}[PASS]{}".format(C["GREEN"], C["RESET"])
-            else:
-                msg  = entry[0] if entry else f.detail
-                icon = "{}[FAIL]{}".format(C["RED"], C["RESET"])
-            lines.append("  {}  {}{}  {}{}".format(
-                icon, C["DIM"], f.check_id, C["RESET"], msg))
+    for layer_num in sorted(layers.keys()):
+        layer_findings = layers[layer_num]
+        fails  = [f for f in layer_findings if not f.passed]
+        passes = [f for f in layer_findings if f.passed]
+
+        lines.append("{}{}{}{}".format(I, C["BOLD"], layer_meta[layer_num].upper(), C["RESET"]))
         lines.append("")
 
+        for f in fails:
+            entry = lines_check.get(f.check_id)
+            msg   = entry[0] if entry else f.detail
+            lines.append("{}  {}\u2716{}  {}{}{}  {}".format(
+                I, C["RED"], C["RESET"],
+                C["DIM"], f.check_id, C["RESET"],
+                msg))
+
+        if passes:
+            n = len(passes)
+            lines.append("{}  {}\u2714  {} check{} passed{}".format(
+                I, C["GREEN"] + C["DIM"], n, "s" if n != 1 else "", C["RESET"]))
+
+        lines.append("")
+
+    # ── Score: hero metric ───────────────────────────────────────────
     fail_count = sum(1 for f in findings if not f.passed)
     pass_count = len(findings) - fail_count
-    lines.append("-" * 68)
+    lines.append(HR)
     lines.append("")
-    lines.append("  SCORE   {}/{}   {}   {}%  {}{}{}".format(
-        pass_count, len(findings), score_bar(score), score,
-        C["BOLD"], rating.upper(), C["RESET"]))
+    lines.append("{}{}  {}%  {}{}{}".format(
+        I, score_bar(score), score, C["BOLD"], rating.upper(), C["RESET"]))
+    lines.append("{}{}{}  of {}  checks passed{}".format(
+        I, C["DIM"], pass_count, len(findings), C["RESET"]))
+    lines.append("")
+    lines.append(HR)
     lines.append("")
 
+    # ── Actions ──────────────────────────────────────────────────────
     if fail_count > 0:
         fixable = [f for f in findings if not f.passed
-                   and (OC_LINES.get(f.check_id) or NC_LINES.get(f.check_id, (None, None, False)))[2] == True]
-        expert  = [f for f in findings if not f.passed
-                   and (OC_LINES.get(f.check_id) or NC_LINES.get(f.check_id, (None, None, False)))[2] != True]
+                   and (OC_LINES.get(f.check_id) or NC_LINES.get(f.check_id, (None, None, False)))[2]]
+        manual  = [f for f in findings if not f.passed
+                   and not (OC_LINES.get(f.check_id) or NC_LINES.get(f.check_id, (None, None, False)))[2]]
 
         if fixable:
-            lines.append("  {}AUTO-FIXABLE NOW ({} issue{}){}".format(
-                C["YELLOW"], len(fixable), "s" if len(fixable) != 1 else "", C["RESET"]))
-            lines.append("  Run:  {}./grits-agent-secure{}".format(C["BOLD"], C["RESET"]))
-            lines.append("")
-        if expert:
-            lines.append("  {}NEEDS AN EXPERT ({} issue{}){}".format(
-                C["RED"], len(expert), "s" if len(expert) != 1 else "", C["RESET"]))
-            for f in expert:
-                entry = lines_check.get(f.check_id)
-                msg = entry[0] if entry else f.detail
-                lines.append("  {}{}{}  {}{}".format(C["DIM"], f.check_id, C["RESET"], msg, ""))
-            lines.append("")
-            lines.append("  Schedule a free 30-min call:  {}{}{}".format(C["BOLD"], GRITS_CONSULT, C["RESET"]))
+            lines.append("{}{}\u2192  Fix {} issue{} automatically{}".format(
+                I, C["YELLOW"],
+                len(fixable), "s" if len(fixable) != 1 else "",
+                C["RESET"]))
+            lines.append("{}   {}./grits-agent-secure{}".format(I, C["BOLD"], C["RESET"]))
             lines.append("")
 
-    lines.append("-" * 68)
-    lines.append("  {}{}{}".format(C["DIM"], GRITS_BRAND, C["RESET"]))
-    lines.append("  {}{}{}".format(C["DIM"], GRITS_REPO, C["RESET"]))
-    lines.append("=" * 68)
+        if manual:
+            lines.append("{}{}Advanced Configurations{}  {}({} item{}){}".format(
+                I, C["CYAN"], C["RESET"],
+                C["DIM"], len(manual), "s" if len(manual) != 1 else "", C["RESET"]))
+            lines.append("")
+            for f in manual:
+                entry = lines_check.get(f.check_id)
+                msg   = entry[0] if entry else f.detail
+                lines.append("{}  {}{}{}  {}{}".format(
+                    I, C["DIM"], f.check_id, C["RESET"],
+                    C["DIM"], msg + C["RESET"]))
+            lines.append("")
+
+    # ── CTA: once at bottom ──────────────────────────────────────────
+    lines.append("{}{}{} \u00b7 {}{}".format(
+        I, C["DIM"], GRITS_BRAND, GRITS_CONSULT, C["RESET"]))
     lines.append("")
     return "\n".join(lines)
 

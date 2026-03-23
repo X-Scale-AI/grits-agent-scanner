@@ -60,10 +60,25 @@ C = _colors()
 
 def step_header(n, total, label):
     print("")
-    print("{}{}{}".format(C["BOLD"], "=" * 68, C["RESET"]))
-    print("{}  STEP {}/{}  --  {}{}".format(C["BOLD"], n, total, label, C["RESET"]))
-    print("{}{}{}".format(C["BOLD"], "=" * 68, C["RESET"]))
+    print("  {}step {}/{}{}  {}{}{}".format(
+        C["DIM"], n, total, C["RESET"],
+        C["BOLD"], label, C["RESET"]))
     print("")
+
+
+def _grade(s):
+    if s >= 90: return "Hardened"
+    if s >= 80: return "Compliant"
+    if s >= 60: return "Partial"
+    if s >= 40: return "At Risk"
+    return "Critical"
+
+
+def _bar(s):
+    filled = int(s / 5)
+    bar    = chr(0x2588) * filled + chr(0x2591) * (20 - filled)
+    color  = C["GREEN"] if s >= 80 else C["YELLOW"] if s >= 40 else C["RED"]
+    return "{}{}{}".format(color, bar, C["RESET"])
 
 
 def get_score(scan_cmd):
@@ -157,38 +172,58 @@ def main():
     score_after = get_score(scan_cmd)
     run_live(scan_cmd)
 
-    # Score delta summary
+    # ── Score delta: hero metric ─────────────────────────────────────
+    HR = "  {}{}{}".format(C["DIM"], "\u2500" * 54, C["RESET"])
     print("")
-    print("{}{}{}".format(C["BOLD"], "=" * 68, C["RESET"]))
+    print(HR)
+    print("")
 
     if score_before is not None and score_after is not None:
-        delta = score_after - score_before
-        sign  = "+" if delta > 0 else ""
-        color = C["GREEN"] if delta > 0 else C["YELLOW"] if delta == 0 else C["RED"]
-        print("  {}SCORE DELTA{}   {}%  ->  {}%   {}({}{}{}){}".format(
-            C["BOLD"], C["RESET"],
-            score_before, score_after,
-            color, sign, delta, "%", C["RESET"]))
+        delta       = score_after - score_before
+        sign        = "+" if delta > 0 else ""
+        delta_color = C["GREEN"] if delta > 0 else C["YELLOW"] if delta == 0 else C["RED"]
+        label_w     = 8   # column width for BEFORE/AFTER labels
+
+        print("  {}BEFORE{}   {}%   {}   {}{}{}".format(
+            C["DIM"], C["RESET"],
+            str(score_before).rjust(3),
+            _bar(score_before),
+            C["DIM"], _grade(score_before).upper(), C["RESET"]))
+        print("  {}AFTER {}   {}%   {}   {}{}{}".format(
+            C["DIM"], C["RESET"],
+            str(score_after).rjust(3),
+            _bar(score_after),
+            C["DIM"], _grade(score_after).upper(), C["RESET"]))
         print("")
+
         if delta == 0:
-            print("  {}Score unchanged.{}".format(C["YELLOW"], C["RESET"]))
+            print("  {}No score change.{}".format(C["YELLOW"], C["RESET"]))
             print("  {}Most likely cause: no openclaw.json config found.{}".format(
                 C["DIM"], C["RESET"]))
             print("  {}Create ~/.openclaw/openclaw.json and re-run.{}".format(
                 C["DIM"], C["RESET"]))
-        elif delta > 0:
-            print("  {}Auto-fixes applied. Address the NEEDS AN EXPERT items above{}".format(
-                C["DIM"], C["RESET"]))
-            print("  {}to improve your score further.{}".format(C["DIM"], C["RESET"]))
         else:
-            print("  {}Score dropped. Review the changes above.{}".format(C["RED"], C["RESET"]))
+            print("  {}         {}{}{} point{} {}{}".format(
+                " " * label_w,
+                delta_color + C["BOLD"],
+                "{}{}%".format(sign, delta),
+                C["RESET"],
+                "s" if abs(delta) != 1 else "",
+                "improvement" if delta > 0 else "regression",
+                ""))
+            if delta > 0:
+                print("  {}Address the Advanced Configurations above to improve further.{}".format(
+                    C["DIM"], C["RESET"]))
+            else:
+                print("  {}Score dropped -- review the changes above.{}".format(
+                    C["RED"], C["RESET"]))
     else:
         print("  {}Could not compute score delta.{}".format(C["DIM"], C["RESET"]))
 
     print("")
-    print("  {}{}{}".format(C["DIM"], GRITS_BRAND, C["RESET"]))
-    print("  {}{}{}".format(C["DIM"], GRITS_REPO, C["RESET"]))
-    print("{}{}{}".format(C["BOLD"], "=" * 68, C["RESET"]))
+    print(HR)
+    print("")
+    print("  {}{} \u00b7 {}{}".format(C["DIM"], GRITS_BRAND, GRITS_CONSULT, C["RESET"]))
     print("")
 
 
