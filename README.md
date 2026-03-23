@@ -17,15 +17,33 @@ GRITS scans your actual config, scores your posture across 5 security layers, fi
 
 ---
 
-## Get Your Score in 30 Seconds
+## Full Audit in One Command
 
 ```bash
 git clone https://github.com/X-Scale-AI/grits-agent-scanner.git
 cd grits-agent-scanner
-./grits-agent-scanner
+./grits-audit
 ```
 
-No dependencies. Python 3 stdlib only. Works on macOS and Linux.
+No dependencies. Python 3 stdlib only. Works on macOS, Ubuntu, and CentOS/RHEL.
+
+`grits-audit` runs the full workflow automatically:
+
+1. **Scans** your config across 5 security layers
+2. **Offers** to apply auto-fixes -- shows every change first, backs up, asks to confirm
+3. **Re-scans** and shows your before/after score delta:
+
+```
+  STEP 3/3  --  VERIFYING -- RE-SCANNING
+  ...
+  SCORE DELTA   21%  ->  47%   (+26%)
+```
+
+### Just the scan
+
+```bash
+./grits-agent-scanner
+```
 
 ```
 ====================================================================
@@ -66,7 +84,12 @@ No dependencies. Python 3 stdlib only. Works on macOS and Linux.
 ## Fix It
 
 ```bash
-# See every change before anything is touched:
+# Full workflow (recommended):
+./grits-audit
+
+# Or run the fixer directly:
+
+# Preview every change before anything is touched:
 ./grits-agent-secure
 
 # Apply -- backs up first, asks for confirmation:
@@ -89,7 +112,7 @@ No dependencies. Python 3 stdlib only. Works on macOS and Linux.
 
 | Fix | What changes | What is never touched |
 |---|---|---|
-| Enable firewall | UFW (Linux) or Application Firewall (macOS) | Existing rules |
+| Enable firewall | UFW (Ubuntu/Debian), firewalld (CentOS/RHEL), Application Firewall (macOS) | Existing rules |
 | Block dangerous tools | Appends to deny list | Tools you already allow |
 | Enable sandbox mode | Sets `agent.sandbox: true` | All other agent settings |
 | Fix .env permissions | Locks to 600, root-owned | File contents |
@@ -155,10 +178,15 @@ Some findings require decisions about your infrastructure. The fixer lists them 
 ## Output Formats
 
 ```bash
-./grits-agent-scanner                        # terminal, color output
+./grits-audit                                # full audit: scan + fix + verify (recommended)
+./grits-audit --scan-only                    # scan only, no fix prompt
+./grits-audit --agent nemoclaw               # audit NemoClaw
+./grits-audit --yes                          # non-interactive (CI/CD)
+
+./grits-agent-scanner                        # scan only, terminal output
 ./grits-agent-scanner --report               # markdown (for PRs, wikis)
-./grits-agent-scanner --json                 # JSON (for CI/CD, dashboards)
-./grits-agent-scanner --agent nemoclaw       # scan NemoClaw instead
+./grits-agent-scanner --json                 # JSON (for dashboards, automation)
+./grits-agent-scanner --agent nemoclaw       # scan NemoClaw
 ./grits-agent-scanner --config /path/to/file # custom config location
 ```
 

@@ -81,7 +81,25 @@ def detect_platform():
     if s == "darwin":  return "macos"
     return "other"
 
+def detect_distro():
+    """Return distro family: 'rhel' (CentOS/RHEL/Fedora/Rocky/Alma) or 'debian' (Ubuntu/Debian) or 'other'."""
+    if platform.system().lower() != "linux":
+        return "other"
+    try:
+        text = Path("/etc/os-release").read_text()
+        for line in text.splitlines():
+            if line.startswith("ID=") or line.startswith("ID_LIKE="):
+                val = line.split("=", 1)[1].strip().strip('"').lower()
+                if any(d in val for d in ("rhel", "centos", "fedora", "rocky", "alma")):
+                    return "rhel"
+                if any(d in val for d in ("debian", "ubuntu")):
+                    return "debian"
+    except Exception:
+        pass
+    return "other"
+
 PLATFORM = detect_platform()
+DISTRO   = detect_distro()
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -358,6 +376,9 @@ def _firewall_already_active():
         status = cmd_run_output("sudo ufw status 2>/dev/null || ufw status 2>/dev/null")
         if status and "Status: active" in status:
             return True
+        fw = cmd_run_output("firewall-cmd --state 2>/dev/null")
+        if fw and "running" in fw.lower():
+            return True
         ipt = cmd_run_output("iptables -L OUTPUT -n 2>/dev/null | head -5")
         if ipt and "DROP" in ipt:
             return True
@@ -379,11 +400,36 @@ def fix_firewall():
 
     if PLATFORM == "linux":
         if cmd_exists("ufw"):
+            # Ubuntu / Debian
             fix.add_cmd("sudo ufw default deny outgoing",  "Default outbound: deny")
             fix.add_cmd("sudo ufw default deny incoming",  "Default inbound: deny")
             fix.add_cmd("sudo ufw allow out 443/tcp",      "Allow HTTPS outbound")
             fix.add_cmd("sudo ufw allow out 53/udp",       "Allow DNS")
             fix.add_cmd("sudo ufw --force enable",         "Enable UFW")
+        elif cmd_exists("firewall-cmd"):
+            # CentOS / RHEL / Fedora / Rocky / AlmaLinux
+            fix.add_cmd("sudo systemctl enable --now firewalld",
+                        "Enable and start firewalld")
+            fix.add_cmd("sudo firewall-cmd --set-default-zone=drop",
+                        "Set default zone to drop (deny all inbound)")
+            fix.add_cmd("sudo firewall-cmd --permanent --add-service=https",
+                        "Allow HTTPS outbound")
+            fix.add_cmd("sudo firewall-cmd --permanent --add-port=53/udp",
+                        "Allow DNS outbound")
+            fix.add_cmd("sudo firewall-cmd --reload",
+                        "Apply permanent rules")
+        elif DISTRO == "rhel":
+            fix.add_cmd("sudo dnf install -y firewalld",   "Install firewalld")
+            fix.add_cmd("sudo systemctl enable --now firewalld",
+                        "Enable and start firewalld")
+            fix.add_cmd("sudo firewall-cmd --set-default-zone=drop",
+                        "Set default zone to drop")
+            fix.add_cmd("sudo firewall-cmd --permanent --add-service=https",
+                        "Allow HTTPS outbound")
+            fix.add_cmd("sudo firewall-cmd --permanent --add-port=53/udp",
+                        "Allow DNS outbound")
+            fix.add_cmd("sudo firewall-cmd --reload",
+                        "Apply permanent rules")
         else:
             fix.add_cmd("sudo apt-get install -y ufw",         "Install UFW")
             fix.add_cmd("sudo ufw default deny outgoing",      "Default outbound: deny")
@@ -453,6 +499,9 @@ def fix_env_perms():
                         "Set {} owner to root:{}".format(env_path.name, group))
             fix.add_cmd("sudo chmod 600 {}".format(env_path),
                         "Set {} permissions to 600".format(env_path.name))
+            if PLATFORM == "linux" and cmd_exists("restorecon"):
+                fix.add_cmd("sudo restorecon -v {}".format(env_path),
+                            "Restore SELinux context (RHEL/CentOS)")
     if not found_any:
         fix.skipped     = True
         fix.skip_reason = "No .env files found."
@@ -476,6 +525,9 @@ def fix_creds_perms():
         fix.add_cmd(
             "[ \"$(ls -A {})\" ] && sudo chmod 600 {}/* || true".format(cred_dir, cred_dir),
             "Set credential files to 600 (owner read/write only, skipped if empty)")
+        if PLATFORM == "linux" and cmd_exists("restorecon"):
+            fix.add_cmd("sudo restorecon -Rv {}".format(cred_dir),
+                        "Restore SELinux context (RHEL/CentOS)")
     else:
         fix.skipped     = True
         fix.skip_reason = "No credentials directory found."

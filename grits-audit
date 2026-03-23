@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""
+grits-audit  v0.3.0
+
+Full security audit in one command: scan -> fix -> verify.
+
+  STEP 1  Scans your agent config across 5 security layers
+  STEP 2  Offers to apply auto-fixes (shows every change first, backs up, asks to confirm)
+  STEP 3  Re-scans and shows your before/after score delta
+
+Usage:
+  ./grits-audit                     # interactive full audit
+  ./grits-audit --scan-only         # scan only, no fix prompt
+  ./grits-audit --agent nemoclaw    # audit NemoClaw instead of OpenClaw
+  ./grits-audit --config /path      # custom config path
+  ./grits-audit --yes               # non-interactive (CI/scripts)
+
+Scored with GRITS v0.3.0 by X Scale AI
+https://github.com/X-Scale-AI/grits-agent-scanner
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+GRITS_VERSION = "0.3.0"
+GRITS_CONSULT = "https://xscaleai.com/consult"
+GRITS_BRAND   = "Scored with GRITS v{} by X Scale AI".format(GRITS_VERSION)
+GRITS_REPO    = "https://github.com/X-Scale-AI/grits-agent-scanner"
+
+HERE    = Path(__file__).resolve().parent
+SCANNER = HERE / "grits-agent-scanner"
+SECURE  = HERE / "grits-agent-secure"
+
+# ---------------------------------------------------------------------------
+# Terminal colors
+# ---------------------------------------------------------------------------
+
+def _colors():
+    if sys.stdout.isatty() and os.environ.get("NO_COLOR") is None:
+        return {
+            "RED":    "\033[91m",
+            "GREEN":  "\033[92m",
+            "YELLOW": "\033[93m",
+            "CYAN":   "\033[96m",
+            "BOLD":   "\033[1m",
+            "DIM":    "\033[2m",
+            "RESET":  "\033[0m",
+        }
+    return {k: "" for k in ["RED", "GREEN", "YELLOW", "CYAN", "BOLD", "DIM", "RESET"]}
+
+C = _colors()
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def step_header(n, total, label):
+    print("")
+    print("{}{}{}".format(C["BOLD"], "=" * 68, C["RESET"]))
+    print("{}  STEP {}/{}  --  {}{}".format(C["BOLD"], n, total, label, C["RESET"]))
+    print("{}{}{}".format(C["BOLD"], "=" * 68, C["RESET"]))
+    print("")
+
+
+def get_score(scan_cmd):
+    """Run scanner with --json, return numeric score or None."""
+    try:
+        r = subprocess.run(
+            scan_cmd + ["--json"],
+            capture_output=True, text=True, timeout=90)
+        data = json.loads(r.stdout)
+        return data.get("score")
+    except Exception:
+        return None
+
+
+def run_live(cmd):
+    """Run command with output streaming to terminal."""
+    subprocess.run(cmd)
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="GRITS Audit -- scan, fix, and verify your agent security in one command",
+        epilog=GRITS_BRAND,
+    )
+    parser.add_argument("--agent",     default="openclaw",
+                        help="Agent to audit: openclaw (default) or nemoclaw")
+    parser.add_argument("--config",    help="Path to config file")
+    parser.add_argument("--yes",       action="store_true",
+                        help="Non-interactive mode -- skip confirmation prompts")
+    parser.add_argument("--scan-only", action="store_true",
+                        help="Run scan only, do not offer auto-fixes")
+    args = parser.parse_args()
+
+    total_steps = 1 if args.scan_only else 3
+
+    scan_cmd   = [str(SCANNER)]
+    secure_cmd = [str(SECURE), "--apply", "--yes"]
+
+    if args.agent != "openclaw":
+        scan_cmd += ["--agent", args.agent]
+    if args.config:
+        scan_cmd   += ["--config", args.config]
+        secure_cmd += ["--config", args.config]
+
+    # -------------------------------------------------------------------------
+    # STEP 1: Initial scan
+    # -------------------------------------------------------------------------
+    step_header(1, total_steps, "SCANNING YOUR AGENT CONFIG")
+    score_before = get_score(scan_cmd)
+    run_live(scan_cmd)
+
+    if args.scan_only:
+        return
+
+    # -------------------------------------------------------------------------
+    # STEP 2: Offer fixes
+    # -------------------------------------------------------------------------
+    step_header(2, total_steps, "AUTO-FIX")
+    print("  The fixer will show every planned change before applying anything.")
+    print("  A full backup is created first. Rollback is one command.")
+    print("")
+
+    if args.yes:
+        answer = "y"
+        print("  {}--yes flag set. Proceeding automatically.{}".format(C["DIM"], C["RESET"]))
+        print("")
+    else:
+        try:
+            answer = input("  Apply auto-fixes now? [y/N]  ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print("")
+            answer = "n"
+
+    if answer not in ("y", "yes"):
+        print("")
+        print("  Skipped. Run  {}./grits-agent-secure --apply{}  when ready.".format(
+            C["BOLD"], C["RESET"]))
+        print("")
+        return
+
+    print("")
+    run_live(secure_cmd)
+
+    # -------------------------------------------------------------------------
+    # STEP 3: Re-scan and show delta
+    # -------------------------------------------------------------------------
+    step_header(3, total_steps, "VERIFYING -- RE-SCANNING")
+    score_after = get_score(scan_cmd)
+    run_live(scan_cmd)
+
+    # Score delta summary
+    print("")
+    print("{}{}{}".format(C["BOLD"], "=" * 68, C["RESET"]))
+
+    if score_before is not None and score_after is not None:
+        delta = score_after - score_before
+        sign  = "+" if delta > 0 else ""
+        color = C["GREEN"] if delta > 0 else C["YELLOW"] if delta == 0 else C["RED"]
+        print("  {}SCORE DELTA{}   {}%  ->  {}%   {}({}{}{}){}".format(
+            C["BOLD"], C["RESET"],
+            score_before, score_after,
+            color, sign, delta, "%", C["RESET"]))
+        print("")
+        if delta == 0:
+            print("  {}Score unchanged.{}".format(C["YELLOW"], C["RESET"]))
+            print("  {}Most likely cause: no openclaw.json config found.{}".format(
+                C["DIM"], C["RESET"]))
+            print("  {}Create ~/.openclaw/openclaw.json and re-run.{}".format(
+                C["DIM"], C["RESET"]))
+        elif delta > 0:
+            print("  {}Auto-fixes applied. Address the NEEDS AN EXPERT items above{}".format(
+                C["DIM"], C["RESET"]))
+            print("  {}to improve your score further.{}".format(C["DIM"], C["RESET"]))
+        else:
+            print("  {}Score dropped. Review the changes above.{}".format(C["RED"], C["RESET"]))
+    else:
+        print("  {}Could not compute score delta.{}".format(C["DIM"], C["RESET"]))
+
+    print("")
+    print("  {}{}{}".format(C["DIM"], GRITS_BRAND, C["RESET"]))
+    print("  {}{}{}".format(C["DIM"], GRITS_REPO, C["RESET"]))
+    print("{}{}{}".format(C["BOLD"], "=" * 68, C["RESET"]))
+    print("")
+
+
+if __name__ == "__main__":
+    main()

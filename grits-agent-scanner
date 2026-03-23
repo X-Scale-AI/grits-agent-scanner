@@ -153,7 +153,25 @@ def detect_platform():
         return "macos"
     return "other"
 
+def detect_distro():
+    """Return distro family: 'rhel' (CentOS/RHEL/Fedora/Rocky/Alma) or 'debian' (Ubuntu/Debian) or 'other'."""
+    if platform.system().lower() != "linux":
+        return "other"
+    try:
+        text = Path("/etc/os-release").read_text()
+        for line in text.splitlines():
+            if line.startswith("ID=") or line.startswith("ID_LIKE="):
+                val = line.split("=", 1)[1].strip().strip('"').lower()
+                if any(d in val for d in ("rhel", "centos", "fedora", "rocky", "alma")):
+                    return "rhel"
+                if any(d in val for d in ("debian", "ubuntu")):
+                    return "debian"
+    except Exception:
+        pass
+    return "other"
+
 PLATFORM = detect_platform()
+DISTRO   = detect_distro()
 
 # ---------------------------------------------------------------------------
 # Shell helpers
@@ -324,6 +342,7 @@ def _oc_firewall_linux():
     f = Finding(1, "Network", "OC01", "Host firewall active", "CRITICAL", "",
                 "sudo ufw default deny outgoing && sudo ufw default deny incoming && "
                 "sudo ufw allow out 443/tcp && sudo ufw allow out 53/udp && sudo ufw --force enable")
+    # UFW -- Ubuntu / Debian
     if cmd_exists("ufw"):
         status = cmd_output("sudo ufw status 2>/dev/null || ufw status 2>/dev/null")
         if status and "Status: active" in status:
@@ -332,17 +351,29 @@ def _oc_firewall_linux():
             return f
         f.detail = "UFW installed but not active."
         return f
+    # firewalld -- CentOS / RHEL / Fedora / Rocky / AlmaLinux
+    if cmd_exists("firewall-cmd"):
+        state = cmd_output("firewall-cmd --state 2>/dev/null")
+        if state and "running" in state.lower():
+            zone = cmd_output("firewall-cmd --get-default-zone 2>/dev/null") or "unknown"
+            f.passed = True
+            f.detail = "firewalld running (default zone: {}).".format(zone)
+            return f
+        f.detail = "firewalld installed but not running."
+        return f
+    # iptables fallback
     ipt = cmd_output("iptables -L OUTPUT -n 2>/dev/null | head -5")
     if ipt and "DROP" in ipt:
         f.passed = True
         f.detail = "iptables OUTPUT chain has DROP policy."
         return f
+    # nftables fallback
     nft = cmd_output("nft list ruleset 2>/dev/null | head -10")
     if nft and "drop" in nft.lower():
         f.passed = True
         f.detail = "nftables ruleset has drop rules."
         return f
-    f.detail = "No active firewall detected (UFW, iptables, or nftables)."
+    f.detail = "No active firewall detected (UFW, firewalld, iptables, or nftables)."
     return f
 
 def _oc_firewall_macos():
@@ -770,9 +801,13 @@ def oc_check_audit_logs():
         if loc.exists():
             indicators.append("logs at {}".format(loc))
             break
-    if cmd_output("grep -rl 'openclaw' /etc/rsyslog.d/ 2>/dev/null"):
+    if (cmd_output("grep -rl 'openclaw' /etc/rsyslog.d/ 2>/dev/null") or
+            cmd_output("grep -l 'openclaw' /etc/rsyslog.conf 2>/dev/null")):
         has_fwd = True
         indicators.append("rsyslog forwarding configured")
+    if cmd_output("grep -Erl 'remote_server|audisp-remote' /etc/audisp/ 2>/dev/null"):
+        has_fwd = True
+        indicators.append("audisp remote logging configured")
     if cmd_output("systemctl list-units 2>/dev/null | grep -i openclaw"):
         has_fwd = True
         indicators.append("systemd unit (journald logging)")
