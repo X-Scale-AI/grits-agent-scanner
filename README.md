@@ -11,7 +11,7 @@
 
 70% of AI agent deployments ship with unrestricted access to your API keys, filesystem, and local network. Most operators never find out until something goes wrong.
 
-**GRITS Audit** scans your agent's live configuration ( specially OpenClaw/NemoClaw agents ) , scores your security posture across 5 layers, and patches what it can automatically -- with a full backup and one-command rollback before touching anything.
+**GRITS Audit** scans your agent's live configuration (OpenClaw and NVIDIA NemoClaw), scores your security posture across 5 layers, and patches what it can automatically -- with a full backup and one-command rollback before touching anything.
 
 ---
 
