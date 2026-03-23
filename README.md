@@ -69,7 +69,8 @@ GRITS isn't just a local developer tool; it is an automated gatekeeper designed 
 To configure GRITS for headless pipeline execution and advanced reporting, run:
 
 ```bash
-./grits-audit --ci-mode --help
+./grits-audit --yes --scan-only       # headless audit, no prompts
+./grits-agent-scanner --json          # machine-readable output for pipelines
 ```
 
 ---
